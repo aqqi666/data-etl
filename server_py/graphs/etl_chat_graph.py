@@ -173,6 +173,8 @@ async def extract_intent_node(state: dict) -> dict:
     ):
         db_intent = await extract_db_intent_from_model(conversation, LLM_API_KEY)
     else:
+        logger.info("[Intent] 跳过意图提取: conn=%s user=%s only_conn=%s",
+                    bool(connection_string), bool(last_user_content), last_message_is_only_connection_string)
         db_intent = {"intent": None, "params": {}}
 
     return {"db_intent": db_intent}
