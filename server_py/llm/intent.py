@@ -1,6 +1,9 @@
 import re
+import logging
 from llm.client import call_llm
 from db.operations import VALID_INTENTS
+
+logger = logging.getLogger("etl.intent")
 
 
 async def extract_db_intent_from_model(conversation, api_key, chat_url=None):
@@ -46,12 +49,13 @@ async def extract_db_intent_from_model(conversation, api_key, chat_url=None):
     ]
 
     try:
-        result = await call_llm(messages, temperature=0.1, max_tokens=1024)
+        result = await call_llm(messages, temperature=0.1, max_tokens=1024, caller="intent")
         if not result.get('ok'):
             return {'intent': None, 'params': {}}
         content = (result.get('content') or '').strip()
         json_match = re.search(r'\{[\s\S]*\}', content)
         if not json_match:
+            logger.info("[Intent] 未匹配到 JSON，raw=%s", content[:200])
             return {'intent': None, 'params': {}}
         import json
         out = json.loads(json_match.group(0))
@@ -59,6 +63,8 @@ async def extract_db_intent_from_model(conversation, api_key, chat_url=None):
         params = out.get('params', {})
         if not isinstance(params, dict):
             params = {}
+        logger.info("[Intent] intent=%s params=%s", intent, params)
         return {'intent': intent, 'params': params}
-    except Exception:
+    except Exception as e:
+        logger.error("[Intent] 解析异常: %s", e)
         return {'intent': None, 'params': {}}

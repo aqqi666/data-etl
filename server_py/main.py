@@ -1,8 +1,23 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import PORT
 from routers import chat, metric_chat, mapping, dml, tables, metric, lineage, debug
+
+# 配置 etl.* 日志：同时输出到终端和文件
+_log_fmt = logging.Formatter("%(asctime)s %(name)s %(message)s", datefmt="%H:%M:%S")
+_etl_logger = logging.getLogger("etl")
+_etl_logger.setLevel(logging.INFO)
+# 终端
+_sh = logging.StreamHandler()
+_sh.setFormatter(_log_fmt)
+_etl_logger.addHandler(_sh)
+# 文件：server_py/etl.log
+_fh = logging.FileHandler("etl.log", encoding="utf-8")
+_fh.setFormatter(_log_fmt)
+_etl_logger.addHandler(_fh)
 
 
 def create_app() -> FastAPI:

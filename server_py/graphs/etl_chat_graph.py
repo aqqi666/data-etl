@@ -4,10 +4,13 @@ Migrated from server.js lines 367-648 (POST /api/chat handler).
 """
 
 import json
+import logging
 import re
 from typing import TypedDict, Optional
 
 from langgraph.graph import StateGraph, END
+
+logger = logging.getLogger("etl.graph")
 
 from db.connection import looks_like_connection_string, test_connection, get_connection_config
 from db.operations import run_database_operation, safe_identifier, VALID_INTENTS
@@ -258,9 +261,9 @@ async def execute_db_operation_node(state: dict) -> dict:
             table_preview = rows_to_markdown_table(rows)
             return_codes.append(f"SELECT 执行成功，返回行数: {len(rows)}")
             render_blocks["SQL_PREVIEW"] = f"```sql\n{sql_preview}\n```"
-            render_blocks["TABLE_PREVIEW"] = table_preview
+            render_blocks["DATA_PREVIEW"] = table_preview
             available.append("SQL_PREVIEW: SELECT预览语句")
-            available.append(f"TABLE_PREVIEW: 前10条数据({len(rows)}行)")
+            available.append(f"DATA_PREVIEW: 前10条数据({len(rows)}行)")
         else:
             err = (preview_result.get("error") or "")
             return_codes.append(f"SELECT 执行失败: {err}")
@@ -446,6 +449,9 @@ async def execute_db_operation_node(state: dict) -> dict:
                 f"并请用户修正后重试。{schema_block}"
             )
 
+    if render_blocks:
+        logger.info("[DB] intent=%s blocks=%s", intent, list(render_blocks.keys()))
+
     return {"db_operation_note": db_operation_note, "render_blocks": render_blocks}
 
 
@@ -556,10 +562,10 @@ async def build_prompt_and_call_llm_node(state: dict) -> dict:
 6. **所有会修改库表或数据的操作（DDL、DML）**：建库、建表、INSERT INTO ... SELECT 等，都必须**先展示 SQL 并提示用户确认**，只有用户明确回复「确认」「执行」「可以」后才会真实执行。不得在用户未确认时执行任何写操作。
 
 **输出格式**：只返回一个 JSON 对象，不要 markdown 代码块：
-{{"reply":"你的回复内容（可含 markdown 格式化，有可用数据块时用 {{{{BLOCK_ID}}}} 引用）","connectionReceived":false,"currentStep":1}}
+{{"reply":"你的回复内容（可含 markdown 格式化，有可用数据块时用 {{BLOCK_ID}} 引用）","connectionReceived":false,"currentStep":1}}
 **重要**：
 - currentStep 必须填入你判断的当前步骤（1～6 的整数），前端会根据它更新进度条。
-- reply 里涉及表数据时，必须是「SQL 代码块 + markdown 表格 + 返回码」三部分，禁止 JSON。**有可用数据块时用 {{{{BLOCK_ID}}}} 引用，表格内容必须与【数据库操作结果】完全一致，不得编造。**"""
+- reply 里涉及表数据时，必须是「SQL 代码块 + markdown 表格 + 返回码」三部分，禁止 JSON。**有可用数据块时用 {{BLOCK_ID}} 引用，表格内容必须与【数据库操作结果】完全一致，不得编造。**"""
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -567,7 +573,7 @@ async def build_prompt_and_call_llm_node(state: dict) -> dict:
     ]
 
     try:
-        result = await call_llm(messages, temperature=0.3, max_tokens=4096)
+        result = await call_llm(messages, temperature=0.3, max_tokens=4096, caller="etl_chat")
         if not result.get("ok"):
             return {
                 "llm_response": {
@@ -597,12 +603,16 @@ async def build_prompt_and_call_llm_node(state: dict) -> dict:
             except (json.JSONDecodeError, ValueError):
                 pass
 
-        # Replace {{BLOCK_ID}} placeholders with actual content
+        # Replace {BLOCK_ID} / {{BLOCK_ID}} placeholders with actual content
         if render_blocks:
             reply = out["reply"]
             for bid, content_val in render_blocks.items():
                 reply = reply.replace("{{" + bid + "}}", content_val)
+                reply = reply.replace("{" + bid + "}", content_val)
             out["reply"] = reply
+
+        logger.info("[ETL] step=%d reply_len=%d blocks_replaced=%s",
+                    out["currentStep"], len(out["reply"]), list(render_blocks.keys()) if render_blocks else [])
 
         return {
             "llm_response": {
@@ -629,7 +639,9 @@ async def build_prompt_and_call_llm_node(state: dict) -> dict:
 def should_test_connection_router(state: dict) -> str:
     """Route after parse_input: test connection or skip to intent extraction."""
     if state.get("should_test_connection"):
+        logger.info("[Router] parse_input → test_connection")
         return "test_connection"
+    logger.info("[Router] parse_input → extract_intent (skip connection test)")
     return "extract_intent"
 
 
@@ -639,7 +651,9 @@ def should_extract_intent_router(state: dict) -> str:
     last_user_content = state.get("last_user_content", "")
     last_message_is_only = state.get("last_message_is_only_connection_string", False)
     if connection_string and last_user_content and not last_message_is_only:
+        logger.info("[Router] test_connection → extract_intent")
         return "extract_intent"
+    logger.info("[Router] test_connection → build_prompt_and_call_llm (skip intent)")
     return "build_prompt_and_call_llm"
 
 
@@ -648,7 +662,9 @@ def has_valid_intent_router(state: dict) -> str:
     db_intent = state.get("db_intent", {})
     connection_string = state.get("connection_string")
     if connection_string and db_intent.get("intent"):
+        logger.info("[Router] extract_intent → execute_db_operation (intent=%s)", db_intent["intent"])
         return "execute_db_operation"
+    logger.info("[Router] extract_intent → build_prompt_and_call_llm (no intent)")
     return "build_prompt_and_call_llm"
 
 

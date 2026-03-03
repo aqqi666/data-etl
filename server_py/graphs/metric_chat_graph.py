@@ -6,9 +6,12 @@ Linear graph: extract_intent_and_execute -> fetch_schema_context -> build_prompt
 
 import re
 import json
+import logging
 from typing import TypedDict, Optional
 
 from langgraph.graph import StateGraph, END
+
+logger = logging.getLogger("etl.metric_graph")
 
 from db.connection import get_connection_config
 from db.operations import run_database_operation, safe_identifier
@@ -96,9 +99,9 @@ async def extract_intent_and_execute_node(state: MetricChatState) -> dict:
             table_preview = rows_to_markdown_table(rows)
             return_codes.append(f'SELECT 执行成功，返回行数: {len(rows)}')
             render_blocks['SQL_PREVIEW'] = f'```sql\nSELECT * FROM {full_tbl} LIMIT 10;\n```'
-            render_blocks['TABLE_PREVIEW'] = table_preview
+            render_blocks['DATA_PREVIEW'] = table_preview
             available.append('SQL_PREVIEW: SELECT预览语句')
-            available.append(f'TABLE_PREVIEW: 前10条数据({len(rows)}行)')
+            available.append(f'DATA_PREVIEW: 前10条数据({len(rows)}行)')
 
         render_blocks['RETURN_CODE'] = '；'.join(return_codes)
         available.append('RETURN_CODE: SQL返回码')
@@ -241,6 +244,9 @@ async def extract_intent_and_execute_node(state: MetricChatState) -> dict:
             f'**失败原因**：{err_msg}\n'
             f'请如实告知用户失败原因并给出修改建议。{schema_block}'
         )
+
+    if render_blocks:
+        logger.info("[DB] intent=%s blocks=%s", intent, list(render_blocks.keys()))
 
     return {'db_operation_note': db_operation_note, 'render_blocks': render_blocks}
 
@@ -386,14 +392,14 @@ async def build_prompt_and_call_llm_node(state: MetricChatState) -> dict:
 **回复规则**：
 - 用中文回复，简洁友好
 - 若有【数据库操作结果】且为失败，必须如实输出失败原因
-- 若有【数据库操作结果】且为成功，必须以 markdown 表格展示数据。有「可用数据块」时用 {{{{BLOCK_ID}}}} 引用
+- 若有【数据库操作结果】且为成功，必须以 markdown 表格展示数据。有「可用数据块」时用 {{BLOCK_ID}} 引用
 - 若本轮没有【数据库操作结果】，不得声称已执行任何数据库操作
 - 所有写操作（CREATE TABLE、INSERT 等）必须先展示 SQL 并提示用户确认
 
 **输出格式**：只返回一个 JSON 对象，不要 markdown 代码块：
 
 当还在讨论或执行数据库操作时：
-{{"reply":"你的回复（可含 markdown，有可用数据块时用 {{{{BLOCK_ID}}}} 引用）"}}
+{{"reply":"你的回复（可含 markdown，有可用数据块时用 {{BLOCK_ID}} 引用）"}}
 
 当用户确认指标后（用户明确说确认/可以/没问题）：
 {{"reply":"指标已创建：xxx","metricDef":{{"name":"指标名称","definition":"指标计算逻辑描述","tables":["db.table1"],"aggregation":"SUM","measureField":"amount"}}}}
@@ -408,7 +414,7 @@ async def build_prompt_and_call_llm_node(state: MetricChatState) -> dict:
         *[{'role': t['role'], 'content': t['content']} for t in conversation],
     ]
 
-    result = await call_llm(messages, temperature=0.3, max_tokens=4096)
+    result = await call_llm(messages, temperature=0.3, max_tokens=4096, caller="metric_chat")
 
     if not result.get('ok'):
         return {
@@ -431,12 +437,16 @@ async def build_prompt_and_call_llm_node(state: MetricChatState) -> dict:
         except (json.JSONDecodeError, ValueError):
             pass
 
-    # Replace {{BLOCK_ID}} placeholders with actual content
+    # Replace {BLOCK_ID} / {{BLOCK_ID}} placeholders with actual content
     if render_blocks:
         reply = out['reply']
         for bid, content_val in render_blocks.items():
             reply = reply.replace('{{' + bid + '}}', content_val)
+            reply = reply.replace('{' + bid + '}', content_val)
         out['reply'] = reply
+
+    logger.info("[Metric] reply_len=%d has_metricDef=%s blocks_replaced=%s",
+                len(out['reply']), 'metricDef' in out, list(render_blocks.keys()) if render_blocks else [])
 
     return {'llm_response': out}
 
