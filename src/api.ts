@@ -14,7 +14,18 @@ export interface ChatContext {
   connectionString?: string | null;
   /** 当前 ETL 步骤 1～6，后端仅执行本步操作 */
   currentStep?: number;
+  /** 用户选中的库表列表（格式 db.table） */
+  selectedTables?: string[];
 }
+
+import type { ChartType } from './types';
+
+/** 指标操作联合类型，由后端 /api/chat 在检测到指标意图时返回 */
+export type MetricAction =
+  | { type: 'preview'; name: string; definition: string; tables: string[]; sql: string; chartType: ChartType; explanation: string }
+  | { type: 'create'; name: string; definition: string; tables: string[]; sql: string; chartType: ChartType; data: Record<string, unknown>[] }
+  | { type: 'update'; targetMetricName: string; sql?: string; chartType?: ChartType; data?: Record<string, unknown>[] }
+  | { type: 'refresh'; targetMetricName: string; data: Record<string, unknown>[] };
 
 export interface ChatApiResponse {
   reply: string;
@@ -23,6 +34,8 @@ export interface ChatApiResponse {
   connectionTestOk?: boolean;
   /** 模型判断的当前步骤 1～6 */
   currentStep?: number;
+  /** 指标操作指令，当后端检测到指标意图时返回 */
+  metricAction?: MetricAction;
 }
 
 export async function fetchChatWithModel(
@@ -98,6 +111,210 @@ export async function fetchOptimizeDml(currentDml: string): Promise<DmlApiRespon
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ dml: currentDml }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((err as { error?: string }).error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+
+// ────────── 指标相关 API ──────────
+
+export interface DatabaseTree {
+  database: string;
+  tables: string[];
+}
+
+export async function fetchTableList(connectionString: string): Promise<{ databases: DatabaseTree[] }> {
+  const res = await fetch('/api/tables', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ connectionString }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((err as { error?: string }).error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export interface MetricMatchRequest {
+  description: string;
+  metricDefs: {
+    name: string;
+    definition: string;
+    tables: string[];
+    aggregation: string;
+    measureField: string;
+  }[];
+}
+
+export interface MetricMatchResponse {
+  matches: { name: string; reason: string }[];
+  suggestion: string;
+}
+
+export async function fetchMetricMatch(payload: MetricMatchRequest): Promise<MetricMatchResponse> {
+  const res = await fetch('/api/metric/match', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((err as { error?: string }).error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export interface MetricGenerateRequest {
+  metricName: string;
+  description: string;
+  metricDefs: {
+    name: string;
+    definition: string;
+    tables: string[];
+    aggregation: string;
+    measureField: string;
+  }[];
+  connectionString: string;
+}
+
+export interface MetricGenerateResponse {
+  sql: string;
+  chartType: 'number' | 'bar' | 'line' | 'pie' | 'table';
+  explanation: string;
+  derivedMetricDef?: {
+    name: string;
+    definition: string;
+    tables: string[];
+    aggregation: string;
+    measureField: string;
+  } | null;
+}
+
+export async function fetchMetricGenerate(payload: MetricGenerateRequest): Promise<MetricGenerateResponse> {
+  const res = await fetch('/api/metric/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((err as { error?: string }).error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export interface MetricQueryRequest {
+  sql: string;
+  connectionString: string;
+}
+
+export interface MetricQueryResponse {
+  rows: Record<string, unknown>[];
+  rowCount: number;
+}
+
+export async function fetchMetricQuery(payload: MetricQueryRequest): Promise<MetricQueryResponse> {
+  const res = await fetch('/api/metric/query', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((err as { error?: string }).error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// ────────── 血缘分析 API ──────────
+
+export interface MetricLineageTable {
+  name: string;
+  role: string;
+  fields: string[];
+}
+
+export interface MetricLineageLayer {
+  level: 'source' | 'processed' | 'metric';
+  label: string;
+  tables: MetricLineageTable[];
+}
+
+export interface MetricLineageEdge {
+  from: { table: string; field: string };
+  to: { table: string; field: string };
+  transform: string;
+}
+
+export interface MetricLineageResponse {
+  layers: MetricLineageLayer[];
+  edges: MetricLineageEdge[];
+  summary: string;
+}
+
+export async function fetchMetricLineage(payload: {
+  metricDef: { name: string; definition: string; tables: string[]; aggregation: string; measureField: string };
+  processedTables: { database: string; table: string; sourceTables: string[]; fieldMappings: { targetField: string; sourceTable: string; sourceExpr: string; transform: string }[]; insertSql: string }[];
+  connectionString: string;
+}): Promise<MetricLineageResponse> {
+  const res = await fetch('/api/metric-lineage', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((err as { error?: string }).error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export interface LineageSourceTable {
+  name: string;
+  alias: string;
+  role: '基表' | '维表' | '关联表';
+  joinType: string;
+  joinCondition: string;
+}
+
+export interface LineageFieldMapping {
+  targetField: string;
+  sourceTable: string;
+  sourceField: string;
+  transform: string;
+  expression: string;
+}
+
+export interface LineageJoinRelation {
+  leftTable: string;
+  rightTable: string;
+  joinType: string;
+  condition: string;
+}
+
+export interface LineageResponse {
+  targetTable: string;
+  sourceTables: LineageSourceTable[];
+  fieldMappings: LineageFieldMapping[];
+  joinRelations: LineageJoinRelation[];
+  groupBy: string;
+  filters: string;
+}
+
+export async function fetchLineage(payload: {
+  sql: string;
+  connectionString: string;
+  targetTable: string;
+}): Promise<LineageResponse> {
+  const res = await fetch('/api/lineage', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));

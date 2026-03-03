@@ -49,3 +49,79 @@ export const ETL_STEP_PLACEHOLDER: Record<EtlStep, string> = {
   5: '发送「开始验证」，我会分析目标表的空值与异常值',
   6: '发送「追溯 xxx 字段」，我去基表查看该字段的源数据情况',
 };
+
+/** Dashboard 相关类型 */
+export interface Dashboard {
+  id: string;
+  name: string;
+  description: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 指标可视化类型 */
+export type ChartType = 'number' | 'bar' | 'line' | 'pie' | 'table';
+
+/** 指标定义 */
+export interface Metric {
+  id: string;
+  dashboardId: string;
+  name: string;
+  definition: string;
+  tables: string[];
+  sql: string;
+  chartType: ChartType;
+  data: Record<string, unknown>[] | null;
+  createdAt: number;
+}
+
+/** 字段映射关系 */
+export interface FieldMapping {
+  /** 目标字段名 */
+  targetField: string;
+  /** 来源表（database.table） */
+  sourceTable: string;
+  /** 来源字段或表达式 */
+  sourceExpr: string;
+  /** 加工逻辑描述（如 SUM、COUNT 等） */
+  transform: string;
+}
+
+/** 已加工表记录 */
+export interface ProcessedTable {
+  /** 唯一标识：database.table */
+  id: string;
+  dashboardId: string;
+  database: string;
+  table: string;
+  /** 基表来源（如有） */
+  sourceTables: string[];
+  /** 字段映射关系 */
+  fieldMappings: FieldMapping[];
+  /** 加工 SQL（INSERT INTO ... SELECT） */
+  insertSql: string;
+  /** 最近加工时间 */
+  processedAt: number;
+}
+
+/** Re-export MetricAction so other modules can import from types */
+export type { MetricAction } from './api';
+
+/** 指标定义（通过对话创建，可用于生成监控数据） */
+export interface MetricDef {
+  id: string;
+  /** 所属 Dashboard */
+  dashboardId: string;
+  /** 指标名称，如"收入"、"订单量" */
+  name: string;
+  /** 指标描述/计算逻辑，如"SUM(amount)"、"COUNT(DISTINCT user_id)" */
+  definition: string;
+  /** 涉及的表 */
+  tables: string[];
+  /** 聚合方式：SUM / COUNT / AVG / COUNT_DISTINCT / MAX / MIN / 自定义 */
+  aggregation: string;
+  /** 度量字段（如 amount、order_id） */
+  measureField: string;
+  /** 创建时间 */
+  createdAt: number;
+}

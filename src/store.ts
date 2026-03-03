@@ -2,6 +2,8 @@ import { create } from 'zustand';
 import type { ChatMessage, ContentBlock, EtlStep } from './types';
 import type { ConversationTurn } from './api';
 import { fetchChatWithModel } from './api';
+import { useProcessedTableStore } from './processedTableStore';
+import { useSchemaStore } from './schemaStore';
 
 let msgId = 0;
 const nextId = () => `msg-${++msgId}`;
@@ -14,11 +16,13 @@ function userMsg(text: string): ChatMessage {
 }
 
 interface AppState {
+  dashboardId: string | null;
   step: EtlStep;
   connectionString: string | null;
   messages: ChatMessage[];
   isProcessing: boolean;
 
+  loadForDashboard: (dashboardId: string) => void;
   sendMessage: (text: string) => void;
   reset: () => void;
 }
@@ -73,16 +77,113 @@ function getDemoConversationMessages(): ChatMessage[] {
   ];
 }
 
-const initialState = {
-  step: 1 as EtlStep,
-  connectionString: null as string | null,
-  messages: [getIntroMessage()],
-  isProcessing: false,
-};
+function getDefaultState() {
+  return {
+    dashboardId: null as string | null,
+    step: 1 as EtlStep,
+    connectionString: null as string | null,
+    messages: [getIntroMessage()],
+    isProcessing: false,
+  };
+}
 
 function looksLikeConnectionString(s: string): boolean {
   if (/^mysql:\/\//i.test(s) || (/^[a-z]+:\/\//i.test(s) && s.includes('@') && /:\d+/.test(s))) return true;
   return /mysql\s+.+-h\s+/i.test(s) && (/-u\s/i.test(s) || /-u'/.test(s));
+}
+
+/** 从对话历史中提取已加工表信息（含字段映射） */
+function extractProcessedTableFromReply(reply: string, allMessages: ChatMessage[]): {
+  database: string; table: string; sourceTables: string[];
+  fieldMappings: { targetField: string; sourceTable: string; sourceExpr: string; transform: string }[];
+  insertSql: string;
+} | null {
+  // 检测 INSERT 执行成功（步骤4完成标志）
+  const insertSuccess = /执行完成|影响行数|数据已写入/i.test(reply) && /INSERT\s+INTO/i.test(reply);
+  // 检测建表成功
+  const createSuccess = /建表成功|表已创建/i.test(reply);
+
+  if (!insertSuccess && !createSuccess) return null;
+
+  // 从回复或历史消息中提取目标表名 `db`.`table` 或 db.table
+  const allText = allMessages.map(m =>
+    m.contents.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map(c => c.text).join('')
+  ).join('\n') + '\n' + reply;
+
+  // 匹配 CREATE TABLE `db`.`table` 或 INSERT INTO `db`.`table`
+  const tableMatch = allText.match(/(?:CREATE\s+TABLE|INSERT\s+INTO)\s+`([^`]+)`\s*\.\s*`([^`]+)`/i);
+  if (!tableMatch) return null;
+
+  const database = tableMatch[1];
+  const table = tableMatch[2];
+
+  // 提取完整的 INSERT SQL
+  let insertSql = '';
+  const insertMatch = allText.match(/INSERT\s+INTO\s+`[^`]+`\s*\.\s*`[^`]+`[^;]*;?/i);
+  if (insertMatch) insertSql = insertMatch[0].trim();
+
+  // 提取基表来源（FROM / JOIN `db`.`table`）
+  const sourceTables: string[] = [];
+  const fromJoinMatches = allText.matchAll(/(?:FROM|JOIN)\s+`([^`]+)`\s*\.\s*`([^`]+)`/gi);
+  for (const m of fromJoinMatches) {
+    const src = `${m[1]}.${m[2]}`;
+    if (src !== `${database}.${table}` && !sourceTables.includes(src)) {
+      sourceTables.push(src);
+    }
+  }
+
+  // 提取字段映射：从 INSERT INTO ... (fields) SELECT ... 中解析
+  const fieldMappings: { targetField: string; sourceTable: string; sourceExpr: string; transform: string }[] = [];
+
+  // 提取目标字段列表
+  const insertFieldsMatch = insertSql.match(/INSERT\s+INTO\s+`[^`]+`\s*\.\s*`[^`]+`\s*\(([^)]+)\)/i);
+  // 提取 SELECT 部分
+  const selectMatch = insertSql.match(/SELECT\s+([\s\S]+?)\s+FROM\s+/i);
+
+  if (insertFieldsMatch && selectMatch) {
+    const targetFields = insertFieldsMatch[1].split(',').map(f => f.trim().replace(/`/g, ''));
+    const selectExprs = splitSelectExprs(selectMatch[1]);
+
+    for (let i = 0; i < targetFields.length && i < selectExprs.length; i++) {
+      const expr = selectExprs[i].trim();
+      // 判断是否有聚合函数
+      const aggMatch = expr.match(/^(SUM|COUNT|AVG|MAX|MIN|GROUP_CONCAT)\s*\(/i);
+      const transform = aggMatch ? aggMatch[1].toUpperCase() : '直接映射';
+
+      // 提取来源字段（简单匹配 `field` 或 alias.`field`）
+      const fieldRef = expr.match(/`([^`]+)`\s*\)/i) || expr.match(/`([^`]+)`/i);
+      const sourceExpr = fieldRef ? fieldRef[1] : expr.replace(/\s+AS\s+\w+$/i, '').trim();
+
+      // 尝试匹配来源表
+      const tableRef = expr.match(/`([^`]+)`\s*\.\s*`([^`]+)`/);
+      const sourceTable = tableRef
+        ? `${tableRef[1]}.${tableRef[2]}`
+        : sourceTables.length > 0 ? sourceTables[0] : '';
+
+      fieldMappings.push({ targetField: targetFields[i], sourceTable, sourceExpr, transform });
+    }
+  }
+
+  return { database, table, sourceTables, fieldMappings, insertSql };
+}
+
+/** 拆分 SELECT 表达式列表（处理嵌套括号内的逗号） */
+function splitSelectExprs(selectPart: string): string[] {
+  const result: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of selectPart) {
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    if (ch === ',' && depth === 0) {
+      result.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim()) result.push(current);
+  return result;
 }
 
 function wantsDemoGuide(text: string): boolean {
@@ -90,7 +191,6 @@ function wantsDemoGuide(text: string): boolean {
   return /操作指南|看演示|看指南|^演示$|^指南$/.test(t) || /^[1一]\.?\s*看/.test(t);
 }
 
-/** 演示每条消息的展示间隔（ms）：助手回复按内容长度加长，符合阅读节奏 */
 function getDemoMessageDelay(msg: ChatMessage): number {
   const base = 1200;
   if (msg.role === 'user') return base;
@@ -100,15 +200,67 @@ function getDemoMessageDelay(msg: ChatMessage): number {
   return base + extra;
 }
 
+/** 持久化当前 dashboard 的聊天状态 */
+function persistState(state: { dashboardId: string | null; step: EtlStep; connectionString: string | null; messages: ChatMessage[] }) {
+  if (!state.dashboardId) return;
+  const key = `etl-chat-${state.dashboardId}`;
+  localStorage.setItem(key, JSON.stringify({
+    step: state.step,
+    connectionString: state.connectionString,
+    messages: state.messages,
+  }));
+}
+
+function loadState(dashboardId: string): { step: EtlStep; connectionString: string | null; messages: ChatMessage[] } | null {
+  try {
+    const raw = localStorage.getItem(`etl-chat-${dashboardId}`);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 export const useStore = create<AppState>((set, get) => ({
-  ...initialState,
+  ...getDefaultState(),
+
+  loadForDashboard: (dashboardId: string) => {
+    msgId = 0;
+    const saved = loadState(dashboardId);
+    if (saved) {
+      // 恢复 msgId
+      const maxId = saved.messages.reduce((max, m) => {
+        const match = m.id.match(/^msg-(\d+)$/);
+        return match ? Math.max(max, parseInt(match[1])) : max;
+      }, 0);
+      msgId = maxId;
+      set({
+        dashboardId,
+        step: saved.step,
+        connectionString: saved.connectionString,
+        messages: saved.messages,
+        isProcessing: false,
+      });
+      // 恢复连接后自动加载库表树
+      if (saved.connectionString) {
+        useSchemaStore.getState().fetchTree(saved.connectionString);
+      }
+    } else {
+      set({
+        ...getDefaultState(),
+        dashboardId,
+      });
+    }
+  },
 
   sendMessage: (text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
 
-    const { messages, step } = get();
-    set({ messages: [...messages, userMsg(trimmed)], isProcessing: true });
+    const { messages, step, dashboardId } = get();
+    const newMessages = [...messages, userMsg(trimmed)];
+    set({ messages: newMessages, isProcessing: true });
+    persistState({ ...get(), messages: newMessages });
 
     if (step === 1 && wantsDemoGuide(trimmed)) {
       const demoList = getDemoConversationMessages();
@@ -116,6 +268,7 @@ export const useStore = create<AppState>((set, get) => ({
       const run = () => {
         if (idx >= demoList.length) {
           set({ isProcessing: false });
+          persistState(get());
           return;
         }
         const next = { ...demoList[idx], id: `demo-${idx}-${Date.now()}` };
@@ -145,37 +298,63 @@ export const useStore = create<AppState>((set, get) => ({
     (async () => {
       try {
         const conversation = buildConversation();
+        const selected = Array.from(useSchemaStore.getState().selectedTables);
         const res = await fetchChatWithModel(conversation, {
           connectionString: get().connectionString || undefined,
           currentStep: get().step,
+          selectedTables: selected.length > 0 ? selected : undefined,
         });
 
-        const newMessages = [...get().messages];
-        newMessages.push(sysMsg({ type: 'text', text: res.reply }));
+        const updatedMessages = [...get().messages];
+        updatedMessages.push(sysMsg({ type: 'text', text: res.reply }));
 
-        const updates: Partial<AppState> = { messages: newMessages, isProcessing: false };
+        const updates: Partial<AppState> = { messages: updatedMessages, isProcessing: false };
 
         if (res.connectionReceived && looksLikeConnectionString(trimmed)) {
           updates.connectionString = trimmed;
+          // 自动加载库表树
+          useSchemaStore.getState().fetchTree(trimmed);
         }
         if (res.currentStep && res.currentStep >= 1 && res.currentStep <= 6) {
           updates.step = res.currentStep as EtlStep;
         }
 
         set(updates);
+        persistState({ ...get(), ...updates } as any);
+
+        // 检测是否有新的已加工表
+        const dashId = get().dashboardId;
+        if (dashId) {
+          const processed = extractProcessedTableFromReply(res.reply, get().messages);
+          if (processed) {
+            useProcessedTableStore.getState().addOrUpdate({
+              dashboardId: dashId,
+              database: processed.database,
+              table: processed.table,
+              sourceTables: processed.sourceTables,
+              fieldMappings: processed.fieldMappings,
+              insertSql: processed.insertSql,
+              processedAt: Date.now(),
+            });
+          }
+        }
       } catch (err) {
-        const newMessages = [...get().messages];
+        const updatedMessages = [...get().messages];
         const errText = err instanceof Error ? err.message : '请求失败';
-        newMessages.push(
+        updatedMessages.push(
           sysMsg({ type: 'text', text: `对话服务暂不可用：${errText}\n\n请检查后端与 DeepSeek 配置。` }),
         );
-        set({ messages: newMessages, isProcessing: false });
+        set({ messages: updatedMessages, isProcessing: false });
+        persistState(get());
       }
     })();
   },
 
   reset: () => {
+    const { dashboardId } = get();
     msgId = 0;
-    set({ ...initialState, messages: [getIntroMessage()] });
+    const fresh = { ...getDefaultState(), dashboardId };
+    set(fresh);
+    persistState(fresh);
   },
 }));

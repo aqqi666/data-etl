@@ -374,6 +374,7 @@ app.post('/api/chat', async (req, res) => {
   }
   const connectionStringFromContext = context?.connectionString || null;
   const currentStepHint = Number(context?.currentStep) || 0;
+  const selectedTables = Array.isArray(context?.selectedTables) ? context.selectedTables : [];
   const userMessages = conversation.filter((t) => t.role === 'user').map((t) => (t.content || '').trim());
   const lastUserContent = userMessages[userMessages.length - 1] || '';
   const lastConnectionStringInChat = [...userMessages].reverse().find(looksLikeConnectionString);
@@ -413,6 +414,19 @@ app.post('/api/chat', async (req, res) => {
     const tbl = safeIdentifier(dbIntent.params.table) || null;
     const fullTbl = tbl ? (db ? `${esc(db)}.${esc(tbl)}` : esc(tbl)) : '';
 
+    // 解析 selectedTables 为 { db -> Set<table> } 映射
+    const selectedDbTables = new Map();
+    for (const st of selectedTables) {
+      const dot = st.indexOf('.');
+      if (dot > 0) {
+        const sdb = st.slice(0, dot);
+        const stbl = st.slice(dot + 1);
+        if (!selectedDbTables.has(sdb)) selectedDbTables.set(sdb, new Set());
+        selectedDbTables.get(sdb).add(stbl);
+      }
+    }
+    const hasSelection = selectedDbTables.size > 0;
+
     if (dbIntent.intent === 'describeTable') {
       const schemaResult = await runDatabaseOperation(connectionString, 'describeTable', dbIntent.params);
       const previewResult = await runDatabaseOperation(connectionString, 'previewData', { ...dbIntent.params, limit: 10 });
@@ -446,13 +460,28 @@ app.post('/api/chat', async (req, res) => {
         const d = opResult.data;
         let sqlAndTable = '';
         if (dbIntent.intent === 'listDatabases') {
-          const sql = 'SHOW DATABASES;（并 SHOW TABLES FROM 各库统计表数）';
-          const table = rowsToMarkdownTable(d.databases || [], ['database', 'tableCount']);
-          const code = `执行成功，返回数据库数: ${d.totalDatabases ?? (d.databases || []).length}`;
+          // 如果有选中的表，只显示选中的库
+          let databases = d.databases || [];
+          if (hasSelection) {
+            databases = databases.filter(item => selectedDbTables.has(item.database));
+          }
+          const sql = hasSelection ? 'SHOW DATABASES;（已按用户选择过滤）' : 'SHOW DATABASES;（并 SHOW TABLES FROM 各库统计表数）';
+          const table = rowsToMarkdownTable(databases, ['database', 'tableCount']);
+          const code = `执行成功，返回数据库数: ${databases.length}`;
           sqlAndTable = `**验证 SQL**：\n\`\`\`sql\n${sql}\n\`\`\`\n**实际返回**：\n${table}\n\n**SQL 返回码**：${code}`;
         } else if (dbIntent.intent === 'listTables') {
+          // 如果有选中的表，只显示选中的表
+          let tables = d.tables || [];
+          const queryDb = db || null;
+          if (hasSelection && queryDb && selectedDbTables.has(queryDb)) {
+            const allowedTables = selectedDbTables.get(queryDb);
+            tables = tables.filter(t => allowedTables.has(t));
+          } else if (hasSelection && !queryDb) {
+            // 没指定库时，显示所有选中库的表
+            tables = [];
+          }
           const sql = db ? `SHOW TABLES FROM ${esc(db)};` : 'SHOW TABLES;';
-          const rows = (d.tables || []).map((t) => ({ '表名': t }));
+          const rows = tables.map((t) => ({ '表名': t }));
           const table = rowsToMarkdownTable(rows, ['表名']);
           const code = `执行成功，返回表数量: ${(d.tables || []).length}`;
           sqlAndTable = `**验证 SQL**：\n\`\`\`sql\n${sql}\n\`\`\`\n**实际返回**：\n${table}\n\n**SQL 返回码**：${code}`;
@@ -503,8 +532,12 @@ app.post('/api/chat', async (req, res) => {
     }
   }
 
-  const systemPrompt = `你是智能数据 ETL 助手，帮助用户通过对话完成完整的 ETL 流程。
+  const selectedTablesNote = selectedTables.length > 0
+    ? `\n**【用户已选中的库表（必须严格遵守）】**：${selectedTables.join(', ')}\n用户在界面上勾选了以上库表，你**只能**使用这些库表进行操作和讨论。不要提及或建议用户使用未选中的库表。当用户说「看看有哪些表」「有哪些库」时，只展示选中范围内的库表。\n`
+    : '';
 
+  const systemPrompt = `你是智能数据 ETL 助手，帮助用户通过对话完成完整的 ETL 流程。
+${selectedTablesNote}
 **步骤自动判断**：ETL 流程有 6 步：1-连接数据库、2-选择基表、3-定义目标表、4-字段映射、5-数据验证、6-异常溯源。
 你需要根据**对话上下文**自动判断当前处于哪一步（currentStep 字段，1～6），并在回复中自然引导用户完成当前步、过渡到下一步。
 
@@ -809,6 +842,890 @@ app.get('/api/debug-deepseek', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
+
+// ────────── /api/tables — 列出连接中所有库的所有表 ──────────
+app.post('/api/tables', async (req, res) => {
+  const { connectionString } = req.body;
+  if (!connectionString) return res.status(400).json({ error: 'Missing connectionString' });
+
+  try {
+    const dbResult = await runDatabaseOperation(connectionString, 'listDatabases', {});
+    if (!dbResult.ok) return res.status(400).json({ error: dbResult.error });
+
+    const systemDbs = new Set(['information_schema', 'mysql', 'performance_schema', 'sys', 'mo_catalog', 'system', 'system_metrics']);
+    const databases = (dbResult.data.databases || [])
+      .filter(d => !systemDbs.has(d.database.toLowerCase()))
+      .map(d => d.database);
+
+    const tree = [];
+    for (const db of databases) {
+      const tblResult = await runDatabaseOperation(connectionString, 'listTables', { database: db });
+      if (tblResult.ok) {
+        tree.push({ database: db, tables: tblResult.data.tables || [] });
+      }
+    }
+    return res.json({ databases: tree });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || '获取表列表失败' });
+  }
+});
+
+// ────────── /api/metric/match — 根据描述匹配已有指标 ──────────
+app.post('/api/metric/match', async (req, res) => {
+  if (!DEEPSEEK_API_KEY) return res.status(503).json({ error: 'DEEPSEEK_API_KEY not configured' });
+
+  const { description, metricDefs } = req.body;
+  if (!description || !Array.isArray(metricDefs) || metricDefs.length === 0) {
+    return res.status(400).json({ error: 'Missing description or metricDefs' });
+  }
+
+  const defsContext = metricDefs.map((md, i) =>
+    `${i + 1}. ${md.name}: ${md.definition}（聚合: ${md.aggregation}，度量字段: ${md.measureField}，涉及表: ${(md.tables || []).join(', ')}）`
+  ).join('\n');
+
+  const systemPrompt = `你是一个数据分析专家。用户描述了想要统计的数据，你需要从已有的指标定义中找出最匹配的指标。
+
+**已有指标定义**：
+${defsContext}
+
+**用户描述**：${description}
+
+请分析用户的需求，从已有指标中选出相关的指标（可以是一个或多个）。
+对每个匹配的指标，说明匹配原因。
+
+只返回 JSON，不要 markdown 代码块：
+{"matches":[{"name":"指标名称","reason":"匹配原因"}],"suggestion":"对用户需求的理解和建议"}`;
+
+  try {
+    const response = await fetch(DEEPSEEK_CHAT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: description },
+        ],
+        stream: false, temperature: 0.2, max_tokens: 1024,
+      }),
+    });
+    const bodyText = await response.text();
+    if (!response.ok) {
+      let errMsg = bodyText || response.statusText;
+      try { const j = JSON.parse(bodyText); errMsg = j.error?.message || j.error || errMsg; } catch (_) {}
+      return res.status(response.status).json({ error: errMsg });
+    }
+    let data;
+    try { data = JSON.parse(bodyText); } catch (e) { return res.status(500).json({ error: 'DeepSeek 返回格式异常' }); }
+    const content = (data.choices?.[0]?.message?.content || '').trim();
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return res.status(500).json({ error: '模型未返回有效 JSON' });
+    const parsed = JSON.parse(jsonMatch[0]);
+    return res.json({
+      matches: Array.isArray(parsed.matches) ? parsed.matches : [],
+      suggestion: parsed.suggestion || '',
+    });
+  } catch (e) {
+    console.error('[/api/metric/match]', e.message);
+    return res.status(500).json({ error: e.message || '匹配失败' });
+  }
+});
+
+// ────────── /api/metric/generate — 根据指标定义 + 维度描述生成 SQL ──────────
+app.post('/api/metric/generate', async (req, res) => {
+  if (!DEEPSEEK_API_KEY) return res.status(503).json({ error: 'DEEPSEEK_API_KEY not configured' });
+
+  const { metricName, definition, description, metricDefs, connectionString } = req.body;
+  if (!metricName || !description) {
+    return res.status(400).json({ error: 'Missing metricName or description' });
+  }
+
+  // 从 metricDefs 收集涉及的表
+  const allTables = new Set();
+  if (Array.isArray(metricDefs)) {
+    for (const md of metricDefs) {
+      if (Array.isArray(md.tables)) md.tables.forEach(t => allTables.add(t));
+    }
+  }
+
+  // 获取所有涉及表的结构
+  let schemaInfo = '';
+  if (connectionString) {
+    for (const tbl of allTables) {
+      const parts = tbl.split('.');
+      const params = parts.length === 2 ? { database: parts[0], table: parts[1] } : { table: parts[0] };
+      const result = await runDatabaseOperation(connectionString, 'describeTable', params);
+      if (result.ok) {
+        const cols = result.data.columns || [];
+        const colList = cols.map(c => `  ${c.Field} ${c.Type}${c.Key === 'PRI' ? ' PRIMARY KEY' : ''}${c.Comment ? ` -- ${c.Comment}` : ''}`).join('\n');
+        schemaInfo += `\n表 ${tbl}:\n${colList}\n`;
+      }
+    }
+  }
+
+  // 构建指标定义上下文
+  const metricDefsContext = Array.isArray(metricDefs) && metricDefs.length > 0
+    ? metricDefs.map(md => `- ${md.name}: ${md.definition}（聚合: ${md.aggregation}，度量字段: ${md.measureField}，涉及表: ${(md.tables || []).join(', ')}）`).join('\n')
+    : '（无指标定义）';
+
+  const systemPrompt = `你是一个数据分析 SQL 专家。用户要基于已定义的指标创建一个监控数据查询。
+
+**已定义的指标**：
+${metricDefsContext}
+
+**用户的监控数据需求**：
+- 名称：${metricName}
+- 描述：${description}
+
+你需要：
+1. 根据用户描述，理解他想要的维度和筛选条件
+2. 结合已定义的指标（聚合方式 + 度量字段），生成带维度的查询 SQL
+3. 推荐最佳的可视化类型
+
+**SQL 语法要求（必须严格遵守）**：
+- 兼容 MySQL 5.7+ 语法
+- **所有中文别名必须用反引号包裹**
+- 库名.表名 格式引用表
+
+**可用表结构**：
+${schemaInfo || '（未提供表结构，请根据指标定义合理推断）'}
+
+**可视化类型选择规则**：
+- number: 结果是单个数值（如总数、平均值、求和）
+- bar: 结果是分类对比（如按类目/地区/状态分组的数值）
+- line: 结果是时间序列趋势（如按日/月的变化）
+- pie: 结果是占比分布（如各类目占比，分组数 ≤ 8）
+- table: 结果是多列明细或复杂结构
+
+只返回 JSON，不要 markdown 代码块：
+{"sql":"SELECT ...","chartType":"number|bar|line|pie|table","explanation":"简要说明查询逻辑","derivedMetricDef":{"name":"...","definition":"...","tables":[...],"aggregation":"...","measureField":"..."}}
+
+**派生指标建议（非常重要，必须认真分析）**：
+你必须分析用户的监控数据是否涉及一个**新的度量概念**，如果是，则**必须**在 derivedMetricDef 中返回派生指标定义。
+
+**必须建议派生指标的场景**：
+1. 监控数据涉及**比率/比值**计算（如毛利率、转化率、占比、净利率等）→ 派生指标为该比率本身
+2. 监控数据涉及**增长率/变化率**（如同比增长率、环比增长率）→ 派生指标为该增长率
+3. 监控数据涉及**复合计算**（如客单价=收入/订单数、人均消费等）→ 派生指标为该复合指标
+4. 监控数据的核心度量概念**不在已定义指标列表中**（即使它是由已有指标组合而来）
+
+**不需要建议的场景**：
+- 监控数据只是对已有指标加维度（如"按月的收入"，收入指标已存在）
+- 监控数据名称和已有指标完全相同
+
+派生指标格式：
+- name: 指标名称（如"净毛利率"、"客单价"、"同比增长率"）
+- definition: 计算逻辑的自然语言描述（如"净毛利除以销售收入的百分比"）
+- tables: 涉及的表
+- aggregation: 最接近的聚合方式（比率类用 "自定义"，简单聚合用 SUM/COUNT/AVG 等）
+- measureField: 核心度量字段（比率类填主要的分子字段）
+
+如果确实不需要建议（仅限上述"不需要"场景），derivedMetricDef 设为 null。
+
+**重要：SQL 兼容性**：
+- 目标数据库可能不支持所有 MySQL 函数。避免使用 QUARTER()、STR_TO_DATE()、WEEK()、DAYOFWEEK() 等高级函数。
+- 用简单的字符串拼接和基础函数替代：CONCAT、LPAD、SUBSTRING、FLOOR、MOD 等。
+- 季度计算用 CEIL(month/3) 或 FLOOR((month-1)/3)+1 替代 QUARTER()。
+- 窗口函数 LAG/LEAD 可能不被支持，改用子查询或自连接。`;
+
+  // ── 生成 SQL 并验证，最多重试 3 次 ──
+  const MAX_RETRIES = 3;
+  let lastSql = '';
+  let lastChartType = 'table';
+  let lastExplanation = '';
+  let lastDerivedMetricDef = null;
+  let lastError = null;
+  let chatMessages = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: `请为监控数据「${metricName}」生成查询 SQL。需求描述：${description}` },
+  ];
+
+  try {
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      const response = await fetch(DEEPSEEK_CHAT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+        body: JSON.stringify({
+          model: 'deepseek-chat',
+          messages: chatMessages,
+          stream: false, temperature: 0.2, max_tokens: 2048,
+        }),
+      });
+      const bodyText = await response.text();
+      if (!response.ok) {
+        let errMsg = bodyText || response.statusText;
+        try { const j = JSON.parse(bodyText); errMsg = j.error?.message || j.error || errMsg; } catch (_) {}
+        return res.status(response.status).json({ error: errMsg });
+      }
+      let data;
+      try { data = JSON.parse(bodyText); } catch (e) { return res.status(500).json({ error: 'DeepSeek 返回格式异常' }); }
+      const content = (data.choices?.[0]?.message?.content || '').trim();
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        if (attempt < MAX_RETRIES - 1) {
+          chatMessages.push({ role: 'assistant', content });
+          chatMessages.push({ role: 'user', content: '请返回有效的 JSON 格式，包含 sql、chartType、explanation 字段。' });
+          continue;
+        }
+        return res.status(500).json({ error: '模型未返回有效 JSON' });
+      }
+
+      let parsed;
+      try { parsed = JSON.parse(jsonMatch[0]); } catch (_) {
+        if (attempt < MAX_RETRIES - 1) {
+          chatMessages.push({ role: 'assistant', content });
+          chatMessages.push({ role: 'user', content: 'JSON 解析失败，请返回合法的 JSON。' });
+          continue;
+        }
+        return res.status(500).json({ error: 'JSON 解析失败' });
+      }
+
+      lastSql = parsed.sql || '';
+      lastChartType = parsed.chartType || 'table';
+      lastExplanation = parsed.explanation || '';
+      lastDerivedMetricDef = parsed.derivedMetricDef || null;
+
+      // 验证 SQL：尝试执行，如果报错则让模型修正
+      if (lastSql && connectionString) {
+        try {
+          const validateResult = await runDatabaseOperation(connectionString, 'executeSQL', { sql: lastSql });
+          if (!validateResult.ok) {
+            lastError = validateResult.error || '执行失败';
+            if (attempt < MAX_RETRIES - 1) {
+              chatMessages.push({ role: 'assistant', content });
+              chatMessages.push({ role: 'user', content: `上面生成的 SQL 执行报错：${lastError}\n\n请修正 SQL 后重新返回 JSON。注意：\n1. 不要使用 QUARTER()、STR_TO_DATE()、WEEK() 等可能不被支持的函数\n2. 季度用 CEIL(月份/3) 计算\n3. 避免窗口函数 LAG/LEAD，改用子查询或自连接\n4. 确保所有列名和表名正确` });
+              continue;
+            }
+            // 最后一次仍然失败，返回 SQL 和错误信息让用户手动修改
+          } else {
+            lastError = null;
+            break; // SQL 验证通过
+          }
+        } catch (e) {
+          // 验证过程异常，不阻塞，返回 SQL 让用户决定
+          break;
+        }
+      } else {
+        break; // 没有连接串，无法验证
+      }
+    }
+
+    // 模型返回的派生指标
+    let derivedMetricDef = lastDerivedMetricDef;
+    const parsed = { sql: lastSql, derivedMetricDef: lastDerivedMetricDef };
+
+    // 如果模型没返回，服务端自动检测是否应该建议派生指标
+    if (!derivedMetricDef) {
+      const nameAndDesc = `${metricName || ''} ${description || ''}`.toLowerCase();
+      const sqlStr = (parsed.sql || '').toLowerCase();
+      const existingNames = new Set((Array.isArray(metricDefs) ? metricDefs : []).map(d => d.name));
+
+      // 检测比率/比值类
+      const ratioPatterns = [
+        { pattern: /毛利率|利润率|净利率/, name: () => nameAndDesc.match(/([\u4e00-\u9fa5]*毛利率|[\u4e00-\u9fa5]*利润率|[\u4e00-\u9fa5]*净利率)/)?.[1] || '毛利率', def: '利润与收入的比值百分比' },
+        { pattern: /转化率|转换率/, name: () => '转化率', def: '转化数量与总数量的比值' },
+        { pattern: /占比|比例|比重/, name: () => nameAndDesc.match(/([\u4e00-\u9fa5]*占比|[\u4e00-\u9fa5]*比例)/)?.[1] || '占比', def: '部分与整体的比值' },
+        { pattern: /客单价|均价|平均价/, name: () => '客单价', def: '总金额除以总订单数' },
+        { pattern: /同比|环比|增长率|变化率/, name: () => nameAndDesc.match(/([\u4e00-\u9fa5]*同比[\u4e00-\u9fa5]*|[\u4e00-\u9fa5]*环比[\u4e00-\u9fa5]*|[\u4e00-\u9fa5]*增长率)/)?.[1] || '增长率', def: '与上期相比的变化百分比' },
+        { pattern: /完成率|达成率/, name: () => '完成率', def: '实际值与目标值的比值' },
+      ];
+
+      // 也检测 SQL 中的除法运算（比率的标志）
+      const hasDivision = /\/\s*(?:SUM|COUNT|AVG|MAX|MIN)\s*\(/i.test(sqlStr) || /SUM\s*\([^)]+\)\s*\/\s*SUM/i.test(sqlStr);
+
+      for (const rp of ratioPatterns) {
+        if (rp.pattern.test(nameAndDesc)) {
+          const derivedName = rp.name();
+          if (!existingNames.has(derivedName)) {
+            // 从已有 metricDefs 中提取涉及的表
+            const tables = [...new Set((Array.isArray(metricDefs) ? metricDefs : []).flatMap(d => d.tables || []))];
+            // 从 SQL 中提取可能的度量字段
+            const fieldMatch = (parsed.sql || '').match(/SUM\s*\(\s*(\w+)\s*\)/i);
+            const measureField = fieldMatch ? fieldMatch[1] : (Array.isArray(metricDefs) && metricDefs[0]?.measureField) || '';
+            derivedMetricDef = {
+              name: derivedName,
+              definition: rp.def,
+              tables: tables,
+              aggregation: '自定义',
+              measureField: measureField,
+            };
+            break;
+          }
+        }
+      }
+
+      // 如果名称没匹配到但 SQL 有除法运算，也建议
+      if (!derivedMetricDef && hasDivision) {
+        const cleanName = (metricName || '').replace(/近半年|最近|每月|月度|年度|趋势|统计/g, '').trim();
+        if (cleanName && !existingNames.has(cleanName)) {
+          const tables = [...new Set((Array.isArray(metricDefs) ? metricDefs : []).flatMap(d => d.tables || []))];
+          const fieldMatch = (parsed.sql || '').match(/SUM\s*\(\s*(\w+)\s*\)/i);
+          derivedMetricDef = {
+            name: cleanName,
+            definition: `${description || cleanName}（派生计算指标）`,
+            tables: tables,
+            aggregation: '自定义',
+            measureField: fieldMatch ? fieldMatch[1] : '',
+          };
+        }
+      }
+    }
+
+    return res.json({
+      sql: lastSql,
+      chartType: ['number', 'bar', 'line', 'pie', 'table'].includes(lastChartType) ? lastChartType : 'table',
+      explanation: lastExplanation + (lastError ? `\n\n⚠️ SQL 验证失败（已尝试 ${MAX_RETRIES} 次自动修正）：${lastError}` : ''),
+      derivedMetricDef,
+    });
+  } catch (e) {
+    console.error('[/api/metric/generate]', e.message);
+    return res.status(500).json({ error: e.message || '生成失败' });
+  }
+});
+
+// ────────── /api/metric/query — 执行指标 SQL 并返回数据 ──────────
+app.post('/api/metric/query', async (req, res) => {
+  const { sql, connectionString } = req.body;
+  if (!sql || !connectionString) {
+    return res.status(400).json({ error: 'Missing sql or connectionString' });
+  }
+
+  const forbidden = /\b(DROP|TRUNCATE|DELETE|UPDATE|INSERT|CREATE|ALTER)\b/i;
+  if (forbidden.test(sql)) {
+    return res.status(400).json({ error: '指标查询仅允许 SELECT 语句' });
+  }
+
+  try {
+    const result = await runDatabaseOperation(connectionString, 'executeSQL', { sql });
+    if (!result.ok) {
+      return res.status(400).json({ error: result.error });
+    }
+    return res.json({ rows: result.data.rows || [], rowCount: result.data.executionSummary?.rowCount || 0 });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || '查询失败' });
+  }
+});
+
+// ────────── /api/lineage — 解析 SQL 返回数据血缘 ──────────
+app.post('/api/lineage', async (req, res) => {
+  if (!DEEPSEEK_API_KEY) return res.status(503).json({ error: 'DEEPSEEK_API_KEY not configured' });
+
+  const { sql, connectionString, targetTable } = req.body;
+  if (!sql) return res.status(400).json({ error: 'Missing sql' });
+
+  // 获取涉及表的结构
+  let schemaInfo = '';
+  if (connectionString) {
+    const tableRefs = extractTableRefsFromSql(sql);
+    for (const ref of tableRefs) {
+      const result = await runDatabaseOperation(connectionString, 'describeTable', { database: ref.database, table: ref.table });
+      if (result.ok) {
+        const cols = result.data.columns || [];
+        const fullName = ref.database ? `${ref.database}.${ref.table}` : ref.table;
+        const colList = cols.map(c => `  ${c.Field} ${c.Type}${c.Comment ? ` -- ${c.Comment}` : ''}`).join('\n');
+        schemaInfo += `\n表 ${fullName}:\n${colList}\n`;
+      }
+    }
+  }
+
+  const systemPrompt = `你是一个 SQL 血缘分析专家。分析以下 INSERT INTO ... SELECT SQL，提取完整的数据血缘关系。
+
+**SQL**:
+\`\`\`sql
+${sql}
+\`\`\`
+
+**涉及表的结构**:
+${schemaInfo || '（未提供）'}
+
+**目标表**: ${targetTable || '从 SQL 中提取'}
+
+请分析并返回 JSON（不要 markdown 代码块），格式如下：
+{
+  "targetTable": "库名.表名",
+  "sourceTables": [
+    {
+      "name": "库名.表名",
+      "alias": "SQL中的别名（如有）",
+      "role": "基表|维表|关联表",
+      "joinType": "LEFT JOIN|INNER JOIN|无（主表）",
+      "joinCondition": "ON 条件（如有）"
+    }
+  ],
+  "fieldMappings": [
+    {
+      "targetField": "目标字段名",
+      "sourceTable": "来源表全名（库名.表名）",
+      "sourceField": "来源字段名",
+      "transform": "加工逻辑描述，如：直接映射、SUM聚合、COUNT计数、CASE WHEN条件转换、LEFT JOIN关联取值、COALESCE空值处理 等",
+      "expression": "原始SQL表达式片段"
+    }
+  ],
+  "joinRelations": [
+    {
+      "leftTable": "库名.表名",
+      "rightTable": "库名.表名",
+      "joinType": "LEFT JOIN|INNER JOIN",
+      "condition": "ON 条件"
+    }
+  ],
+  "groupBy": "GROUP BY 字段列表（如有）",
+  "filters": "WHERE 条件（如有）"
+}
+
+**要求**：
+- 每个目标字段都必须追溯到具体的来源表和来源字段
+- 如果一个目标字段涉及多个来源表/字段（如 JOIN 后取值），列出主要来源
+- transform 要用中文描述清楚加工逻辑
+- 维表（通过 JOIN 关联的查找表）的 role 标记为"维表"
+- 主要数据来源表的 role 标记为"基表"
+- sourceTables 必须包含 SQL 中 FROM 和所有 JOIN 涉及的表`;
+
+  try {
+    const response = await fetch(DEEPSEEK_CHAT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: '请分析这条 SQL 的数据血缘关系。' },
+        ],
+        stream: false, temperature: 0.1, max_tokens: 4096,
+      }),
+    });
+    const bodyText = await response.text();
+    if (!response.ok) {
+      let errMsg = bodyText || response.statusText;
+      try { const j = JSON.parse(bodyText); errMsg = j.error?.message || j.error || errMsg; } catch (_) {}
+      return res.status(response.status).json({ error: errMsg });
+    }
+    let data;
+    try { data = JSON.parse(bodyText); } catch (e) { return res.status(500).json({ error: 'DeepSeek 返回格式异常' }); }
+    const content = (data.choices?.[0]?.message?.content || '').trim();
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return res.status(500).json({ error: '模型未返回有效 JSON' });
+    const parsed = JSON.parse(jsonMatch[0]);
+    return res.json(parsed);
+  } catch (e) {
+    console.error('[/api/lineage]', e.message);
+    return res.status(500).json({ error: e.message || '血缘分析失败' });
+  }
+});
+
+// ────────── /api/metric-lineage — 指标全链路血缘 ──────────
+app.post('/api/metric-lineage', async (req, res) => {
+  if (!DEEPSEEK_API_KEY) return res.status(503).json({ error: 'DEEPSEEK_API_KEY not configured' });
+
+  const { metricDef, processedTables, connectionString } = req.body;
+  if (!metricDef) return res.status(400).json({ error: 'Missing metricDef' });
+
+  // 收集所有相关的加工 SQL
+  const relevantTables = (metricDef.tables || []);
+  const allProcessed = (processedTables || []);
+  // 直接匹配指标涉及的表
+  const directMatch = allProcessed.filter(pt =>
+    relevantTables.some(t => t === `${pt.database}.${pt.table}`)
+  );
+  // 如果直接匹配为空，使用所有传入的加工表（前端已按 dashboard 过滤）
+  const relevantProcessed = directMatch.length > 0 ? directMatch : allProcessed;
+
+  // 获取表结构
+  let schemaInfo = '';
+  if (connectionString) {
+    const allTbls = new Set(relevantTables);
+    for (const pt of relevantProcessed) {
+      (pt.sourceTables || []).forEach(s => allTbls.add(s));
+    }
+    for (const tbl of allTbls) {
+      const parts = tbl.split('.');
+      if (parts.length === 2) {
+        const result = await runDatabaseOperation(connectionString, 'describeTable', { database: parts[0], table: parts[1] });
+        if (result.ok) {
+          const cols = (result.data.columns || []).map(c => `  ${c.Field} ${c.Type}${c.Comment ? ` -- ${c.Comment}` : ''}`).join('\n');
+          schemaInfo += `\n表 ${tbl}:\n${cols}\n`;
+        }
+      }
+    }
+  }
+
+  // 收集加工 SQL 和字段映射信息
+  const etlInfo = relevantProcessed.map(pt => {
+    const mappingInfo = Array.isArray(pt.fieldMappings) && pt.fieldMappings.length > 0
+      ? `  字段映射:\n${pt.fieldMappings.map(fm =>
+          `    ${fm.targetField} ← ${fm.sourceTable}.${fm.sourceExpr} (${fm.transform})`
+        ).join('\n')}`
+      : '';
+    return `加工表 ${pt.database}.${pt.table}:\n  来源表: ${(pt.sourceTables || []).join(', ')}${mappingInfo ? '\n' + mappingInfo : ''}\n  加工SQL: ${pt.insertSql || '无'}`;
+  }).join('\n\n');
+
+  const systemPrompt = `你是一个数据血缘分析专家。请分析指标的全链路血缘，从最底层的基表/维表到加工后的业务表，再到指标本身。
+
+**指标信息**：
+- 名称：${metricDef.name}
+- 定义：${metricDef.definition}
+- 聚合方式：${metricDef.aggregation}
+- 度量字段：${metricDef.measureField}
+- 涉及表：${relevantTables.join(', ')}
+
+**ETL 加工信息（这是真实的加工记录，必须严格依据此信息确定基表和维表）**：
+${etlInfo || '（无加工信息）'}
+
+**重要规则**：
+- source 层的基表/维表**必须**来自上方 ETL 加工信息中的「来源表」和「字段映射」，不得自行编造。
+- 如果 ETL 加工信息中有字段映射，基表是提供主要数据的来源表，维表是通过 JOIN 关联的查找表。
+- 如果 ETL 加工信息中有加工 SQL（INSERT INTO ... SELECT ... FROM ... JOIN ...），从 SQL 中的 FROM 确定基表，从 JOIN 确定维表。
+- 如果没有 ETL 加工信息，则指标涉及的表本身就是基表，不要编造不存在的表。
+
+**表结构**：
+${schemaInfo || '（未提供）'}
+
+请分析并返回该指标的全链路血缘，**只包含与该指标相关的字段**。
+
+返回 JSON（不要 markdown 代码块）：
+{
+  "layers": [
+    {
+      "level": "source",
+      "label": "基表/维表",
+      "tables": [
+        {
+          "name": "db.table",
+          "role": "基表|维表",
+          "fields": ["只列出与指标相关的字段"]
+        }
+      ]
+    },
+    {
+      "level": "processed",
+      "label": "加工业务表",
+      "tables": [
+        {
+          "name": "db.table",
+          "role": "业务表",
+          "fields": ["只列出与指标相关的字段"]
+        }
+      ]
+    },
+    {
+      "level": "metric",
+      "label": "指标",
+      "tables": [
+        {
+          "name": "${metricDef.name}",
+          "role": "指标",
+          "fields": ["${metricDef.aggregation}(${metricDef.measureField})"]
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from": {"table": "源表名", "field": "源字段"},
+      "to": {"table": "目标表名", "field": "目标字段"},
+      "transform": "加工逻辑（如直接映射、SUM、JOIN等）"
+    }
+  ],
+  "summary": "一句话总结该指标的数据流转路径"
+}`;
+
+  try {
+    const response = await fetch(DEEPSEEK_CHAT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `请分析指标「${metricDef.name}」的全链路血缘` },
+        ],
+        stream: false, temperature: 0.1, max_tokens: 4096,
+      }),
+    });
+    const bodyText = await response.text();
+    if (!response.ok) {
+      let errMsg = bodyText || response.statusText;
+      try { const j = JSON.parse(bodyText); errMsg = j.error?.message || j.error || errMsg; } catch (_) {}
+      return res.status(response.status).json({ error: errMsg });
+    }
+    let data;
+    try { data = JSON.parse(bodyText); } catch (e) { return res.status(500).json({ error: 'DeepSeek 返回格式异常' }); }
+    const content = (data.choices?.[0]?.message?.content || '').trim();
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return res.status(500).json({ error: '模型未返回有效 JSON' });
+    const parsed = JSON.parse(jsonMatch[0]);
+    return res.json(parsed);
+  } catch (e) {
+    console.error('[/api/metric-lineage]', e.message);
+    return res.status(500).json({ error: e.message || '指标血缘分析失败' });
+  }
+});
+
+// ────────── /api/metric-chat — 指标定义对话 ──────────
+app.post('/api/metric-chat', async (req, res) => {
+  if (!DEEPSEEK_API_KEY) return res.status(503).json({ error: 'DEEPSEEK_API_KEY not configured' });
+
+  const { conversation, connectionString, selectedTables } = req.body;
+  if (!Array.isArray(conversation) || conversation.length === 0) {
+    return res.status(400).json({ error: 'Missing conversation' });
+  }
+  const selected = Array.isArray(selectedTables) ? selectedTables : [];
+
+  // ── 数据库操作（与 ETL chat 完全一致的能力） ──
+  let dbOperationNote = '';
+  if (connectionString) {
+    const dbIntent = await extractDbIntentFromModel(conversation, DEEPSEEK_API_KEY, DEEPSEEK_CHAT_URL);
+
+    if (dbIntent.intent) {
+      const esc = (n) => { const s = safeIdentifier(n); return s ? '`' + s + '`' : ''; };
+      const db = safeIdentifier(dbIntent.params.database) || null;
+      const tbl = safeIdentifier(dbIntent.params.table) || null;
+      const fullTbl = tbl ? (db ? `${esc(db)}.${esc(tbl)}` : esc(tbl)) : '';
+
+      if (dbIntent.intent === 'describeTable') {
+        const schemaResult = await runDatabaseOperation(connectionString, 'describeTable', dbIntent.params);
+        const previewResult = await runDatabaseOperation(connectionString, 'previewData', { ...dbIntent.params, limit: 10 });
+        const parts = [];
+        const returnCodes = [];
+        if (schemaResult.ok) {
+          const cols = schemaResult.data.columns || [];
+          const tableSchema = rowsToMarkdownTable(cols, ['Field', 'Type', 'Null', 'Key', 'Default', 'Extra']);
+          returnCodes.push(`DESCRIBE 执行成功，返回列数: ${cols.length}`);
+          parts.push(`**表结构**：\n${tableSchema}`);
+        } else {
+          returnCodes.push(`DESCRIBE 执行失败: ${schemaResult.error}`);
+          parts.push(`**表结构查询失败**：${schemaResult.error}`);
+        }
+        if (previewResult.ok) {
+          const rows = previewResult.data.rows || [];
+          const tablePreview = rowsToMarkdownTable(rows);
+          returnCodes.push(`SELECT 执行成功，返回行数: ${rows.length}`);
+          parts.push(`**前10条数据**：\n${tablePreview}`);
+        }
+        parts.push(`**SQL 返回码**：${returnCodes.join('；')}`);
+        dbOperationNote = `\n\n**【数据库操作结果】** 已查询表结构和数据预览。你必须在回复中以 markdown 表格展示，不得编造数据。\n${parts.join('\n\n')}`;
+      } else {
+        const opResult = await runDatabaseOperation(connectionString, dbIntent.intent, dbIntent.params);
+        if (opResult.ok) {
+          const d = opResult.data;
+          let sqlAndTable = '';
+          if (dbIntent.intent === 'listDatabases') {
+            let databases = d.databases || [];
+            // 如果有选中的表，过滤
+            if (selected.length > 0) {
+              const selectedDbs = new Set(selected.map(s => s.split('.')[0]));
+              databases = databases.filter(item => selectedDbs.has(item.database));
+            }
+            const table = rowsToMarkdownTable(databases, ['database', 'tableCount']);
+            sqlAndTable = `**实际返回**：\n${table}\n返回数据库数: ${databases.length}`;
+          } else if (dbIntent.intent === 'listTables') {
+            let tables = d.tables || [];
+            if (selected.length > 0 && db) {
+              const allowedTables = new Set(selected.filter(s => s.startsWith(db + '.')).map(s => s.split('.')[1]));
+              if (allowedTables.size > 0) tables = tables.filter(t => allowedTables.has(t));
+            }
+            const rows = tables.map((t) => ({ '表名': t }));
+            const table = rowsToMarkdownTable(rows, ['表名']);
+            sqlAndTable = `**实际返回**：\n${table}\n返回表数量: ${tables.length}`;
+          } else if (dbIntent.intent === 'previewData') {
+            const table = rowsToMarkdownTable(d.rows || []);
+            sqlAndTable = `**实际返回**：\n${table}\n返回行数: ${d.rowCount ?? (d.rows || []).length}`;
+          } else if (dbIntent.intent === 'analyzeNulls') {
+            const table = rowsToMarkdownTable(d.columns || [], ['column', 'nullCount', 'nullRate']);
+            sqlAndTable = `**实际返回（空值统计）**：\n${table}\n总行数: ${d.totalRows ?? '-'}`;
+          } else if (dbIntent.intent === 'executeSQL' && d.rows != null && d.rows.length > 0) {
+            const sql = String(dbIntent.params.sql || '').trim();
+            const table = rowsToMarkdownTable(d.rows);
+            const code = d.executionSummary?.message || `执行成功，返回行数: ${d.rows.length}`;
+            sqlAndTable = `**执行的 SQL**：\n\`\`\`sql\n${sql}\n\`\`\`\n**实际返回**：\n${table}\n**SQL 返回码**：${code}`;
+          } else if (dbIntent.intent === 'executeSQL') {
+            const sql = String(dbIntent.params.sql || '').trim();
+            const code = d.executionSummary?.message || '执行完成。';
+            sqlAndTable = `**执行的 SQL**：\n\`\`\`sql\n${sql}\n\`\`\`\n**SQL 返回码**：${code}`;
+          } else if (dbIntent.intent === 'createTable') {
+            sqlAndTable = `**结果**：${d.message || '表已创建'}`;
+          } else if (dbIntent.intent === 'createDatabase') {
+            sqlAndTable = `**结果**：${d.message || '数据库已创建'}`;
+          } else {
+            sqlAndTable = `\n\`\`\`json\n${JSON.stringify(d, null, 2)}\n\`\`\``;
+          }
+          dbOperationNote = `\n\n**【数据库操作结果】** 执行「${dbIntent.intent}」**成功**。你必须在回复中展示结果，表格内容必须与下方一致，不得编造。\n${sqlAndTable}`;
+        } else {
+          const errMsg = opResult.error || '';
+          // 如果是列名错误，自动查表结构帮助纠正
+          let schemaBlock = '';
+          const isColumnError = /column\s+['\`]?\w+['\`]?\s+does not exist|Unknown column|doesn't have column/i.test(errMsg);
+          if (dbIntent.intent === 'executeSQL' && isColumnError && dbIntent.params.sql) {
+            const tableRefs = extractTableRefsFromSql(dbIntent.params.sql);
+            const schemaParts = [];
+            for (const ref of tableRefs) {
+              const desc = await runDatabaseOperation(connectionString, 'describeTable', { database: ref.database, table: ref.table });
+              if (desc.ok && desc.data && desc.data.columns) {
+                const fullName = ref.database ? `${ref.database}.${ref.table}` : ref.table;
+                const tableSchema = rowsToMarkdownTable(desc.data.columns, ['Field', 'Type', 'Null', 'Key', 'Default', 'Extra']);
+                schemaParts.push(`**表 ${fullName} 的真实结构**：\n${tableSchema}`);
+              }
+            }
+            if (schemaParts.length > 0) {
+              schemaBlock = `\n\n**【自我纠正】** 已自动查询涉及表的结构。请根据真实列名给出修正后的 SQL。\n\n${schemaParts.join('\n\n')}`;
+            }
+          }
+          dbOperationNote = `\n\n**【数据库操作结果】** 执行「${dbIntent.intent}」**失败**。\n**失败原因**：${errMsg}\n请如实告知用户失败原因并给出修改建议。${schemaBlock}`;
+        }
+      }
+    }
+  }
+
+  // 获取可用表结构信息（优先只查选中的表，否则全量扫描）
+  let schemaContext = '';
+  if (connectionString && selected.length > 0) {
+    const schemaLines = [];
+    for (const tbl of selected) {
+      const parts = tbl.split('.');
+      if (parts.length === 2) {
+        const descResult = await runDatabaseOperation(connectionString, 'describeTable', { database: parts[0], table: parts[1] });
+        if (descResult.ok && descResult.data.columns) {
+          const cols = descResult.data.columns.map(c =>
+            `    ${c.Field} ${c.Type}${c.Comment ? ` -- ${c.Comment}` : ''}`
+          ).join('\n');
+          schemaLines.push(`  ${tbl}:\n${cols}`);
+        }
+      }
+    }
+    if (schemaLines.length > 0) {
+      schemaContext = `\n\n**可用表结构（仅限用户选中的 ${selected.length} 张表，严禁使用其他表）**：\n${schemaLines.join('\n\n')}`;
+    }
+  } else if (connectionString) {
+    try {
+      const dbResult = await runDatabaseOperation(connectionString, 'listDatabases', {});
+      if (dbResult.ok) {
+        const systemDbs = new Set(['information_schema', 'mysql', 'performance_schema', 'sys', 'mo_catalog', 'system', 'system_metrics']);
+        const databases = (dbResult.data.databases || [])
+          .filter(d => !systemDbs.has(d.database.toLowerCase()))
+          .map(d => d.database);
+
+        const schemaLines = [];
+        for (const db of databases.slice(0, 10)) {
+          const tblResult = await runDatabaseOperation(connectionString, 'listTables', { database: db });
+          if (tblResult.ok && tblResult.data.tables) {
+            for (const tbl of tblResult.data.tables.slice(0, 20)) {
+              const descResult = await runDatabaseOperation(connectionString, 'describeTable', { database: db, table: tbl });
+              if (descResult.ok && descResult.data.columns) {
+                const cols = descResult.data.columns.map(c =>
+                  `    ${c.Field} ${c.Type}${c.Comment ? ` -- ${c.Comment}` : ''}`
+                ).join('\n');
+                schemaLines.push(`  ${db}.${tbl}:\n${cols}`);
+              }
+            }
+          }
+        }
+        if (schemaLines.length > 0) {
+          schemaContext = `\n\n**可用表结构**：\n${schemaLines.join('\n\n')}`;
+        }
+      }
+    } catch (e) {
+      // ignore schema fetch errors
+    }
+  }
+
+  const selectedTablesRestriction = selected.length > 0
+    ? `\n**【严格限制】用户已在界面上选中了 ${selected.length} 张表（${selected.join(', ')}）。你必须且只能使用上方列出的表进行分析和建议。绝对不要提及、推测或建议任何未列出的表。**\n`
+    : '';
+
+  const systemPrompt = `你是一个智能数据助手，同时具备**数据加工（ETL）**和**指标定义**两种能力。
+${selectedTablesRestriction}
+
+## 能力一：数据加工（ETL）
+你可以帮助用户完成完整的数据库操作，包括：
+- 查看数据库列表、表列表、表结构、数据预览
+- 创建数据库、创建表（需用户确认后执行）
+- 执行 SQL 查询（SELECT 直接执行，INSERT/CREATE 等写操作需用户确认）
+- 分析数据质量（空值率、异常值）
+- 字段映射与数据加工（INSERT INTO ... SELECT）
+
+**数据库操作规则**：
+- 所有会修改库表或数据的操作（DDL、DML）必须先展示完整 SQL 并获用户确认后才能执行
+- 只读操作（SELECT、DESCRIBE、SHOW）可直接执行
+- 所有 SQL 必须严格符合 MySQL 语法
+- 展示数据时必须用 markdown 表格，禁止 JSON
+- 若有【数据库操作结果】，必须如实展示，不得编造
+
+## 能力二：指标定义
+你可以帮助用户定义纯度量指标（不含维度）：
+- 指标 = 一个度量（如"收入"、"订单量"、"活跃用户数"）
+- 维度在后续"添加监控数据"时由用户指定
+- 指标定义需要明确：指标名称、计算逻辑描述、聚合方式、度量字段、涉及的表
+
+**指标定义流程**：
+1. 用户描述想要的指标
+2. 你根据可用表结构分析可用字段
+3. 给出聚合方式和度量字段建议
+4. 用户确认后生成指标定义
+
+## 如何判断用户意图
+- 用户说「看看有哪些库」「查看表结构」「建表」「执行SQL」「加工数据」等 → 数据加工能力
+- 用户说「定义指标」「我想看收入」「统计订单量」「添加指标」等 → 指标定义能力
+- 两种能力可以混合使用，比如用户可能先查看表结构再定义指标
+
+${schemaContext}
+${dbOperationNote}
+
+**回复规则**：
+- 用中文回复，简洁友好
+- 若有【数据库操作结果】且为失败，必须如实输出失败原因
+- 若有【数据库操作结果】且为成功，必须以 markdown 表格展示数据
+- 若本轮没有【数据库操作结果】，不得声称已执行任何数据库操作
+- 所有写操作（CREATE TABLE、INSERT 等）必须先展示 SQL 并提示用户确认
+
+**输出格式**：只返回一个 JSON 对象，不要 markdown 代码块：
+
+当还在讨论或执行数据库操作时：
+{"reply":"你的回复（可含 markdown）"}
+
+当用户确认指标后（用户明确说确认/可以/没问题）：
+{"reply":"指标已创建：xxx","metricDef":{"name":"指标名称","definition":"指标计算逻辑描述","tables":["db.table1"],"aggregation":"SUM","measureField":"amount"}}
+
+**aggregation 可选值**：SUM、COUNT、AVG、COUNT_DISTINCT、MAX、MIN
+**measureField**：被聚合的字段名
+
+**重要**：只有用户明确确认后才返回 metricDef。讨论阶段不要返回 metricDef。`;
+
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...conversation.map(t => ({ role: t.role, content: t.content })),
+  ];
+
+  try {
+    const response = await fetch(DEEPSEEK_CHAT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+      body: JSON.stringify({ model: 'deepseek-chat', messages, stream: false, temperature: 0.3, max_tokens: 4096 }),
+    });
+    const bodyText = await response.text();
+    if (!response.ok) {
+      let errMsg = bodyText || response.statusText;
+      try { const j = JSON.parse(bodyText); errMsg = j.error?.message || j.error || errMsg; } catch (_) {}
+      return res.status(response.status).json({ error: errMsg });
+    }
+    let data;
+    try { data = JSON.parse(bodyText); } catch (e) { return res.status(500).json({ error: 'DeepSeek 返回格式异常' }); }
+    const content = (data.choices?.[0]?.message?.content || '').trim();
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    let out = { reply: content };
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (typeof parsed.reply === 'string') out.reply = parsed.reply;
+        if (parsed.metricDef) out.metricDef = parsed.metricDef;
+      } catch (_) {}
+    }
+    return res.json(out);
+  } catch (e) {
+    console.error('[/api/metric-chat]', e.message);
+    return res.status(500).json({ error: e.message || '指标对话失败' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`ETL API server http://localhost:${PORT}`);
   console.log(`  DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY ? '已设置' : '未设置'}`);
