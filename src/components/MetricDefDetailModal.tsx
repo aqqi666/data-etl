@@ -198,8 +198,9 @@ function InfoTab({ def, relatedMetrics }: { def: MetricDef; relatedMetrics: { na
 }
 
 function SqlTab({ def, relatedMetrics }: { def: MetricDef; relatedMetrics: { name: string; sql: string; chartType: string }[] }) {
-  // 指标公式
-  const formula = `${def.aggregation}(${def.measureField})`;
+  // 指标公式：构造完整 SQL
+  const tableName = def.tables.length > 0 ? def.tables[0] : '<table>';
+  const formula = `SELECT ${def.aggregation}(${def.measureField}) AS ${def.name}\nFROM ${tableName}`;
 
   return (
     <div className="space-y-4">
