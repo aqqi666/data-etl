@@ -24,8 +24,8 @@ async def metric_chat(request_body: dict):
             'conversation': conversation,
             'connection_string': connection_string,
             'selected_tables': selected_tables if isinstance(selected_tables, list) else [],
-            'db_operation_note': '',
             'schema_context': '',
+            'render_blocks': {},
             'llm_response': {},
         }
         result = await graph.ainvoke(initial_state)

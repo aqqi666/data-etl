@@ -30,9 +30,7 @@ async def chat(request_body: dict):
             'should_test_connection': False,
             'connection_test_note': '',
             'connection_test_ok': False,
-            'db_intent': {'intent': None, 'params': {}},
-            'db_operation_note': '',
-            'selected_tables_note': '',
+            'render_blocks': {},
             'llm_response': {},
         }
         result = await graph.ainvoke(initial_state)

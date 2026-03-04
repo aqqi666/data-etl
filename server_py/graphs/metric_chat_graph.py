@@ -1,8 +1,4 @@
-"""Metric conversation LangGraph state graph.
-
-Migrated from server.js lines 1464-1727 (POST /api/metric-chat handler).
-Linear graph: extract_intent_and_execute -> fetch_schema_context -> build_prompt_and_call_llm -> END
-"""
+"""Metric conversation LangGraph state graph (tool calling 版本)."""
 
 import re
 import json
@@ -16,10 +12,8 @@ logger = logging.getLogger("etl.metric_graph")
 from db.connection import get_connection_config
 from db.operations import run_database_operation, safe_identifier
 from llm.client import call_llm
-from llm.intent import extract_db_intent_from_model
+from llm.tools import SQL_TOOLS, execute_tool_call
 from utils.formatters import rows_to_markdown_table
-from utils.sql_parser import extract_table_refs_from_sql
-from config import LLM_API_KEY
 
 
 # ---------------------------------------------------------------------------
@@ -30,229 +24,13 @@ class MetricChatState(TypedDict):
     conversation: list
     connection_string: Optional[str]
     selected_tables: list
-    db_operation_note: str
-    render_blocks: dict  # {block_id: actual_content} for placeholder replacement
     schema_context: str
+    render_blocks: dict
     llm_response: dict
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _esc(name: str) -> str:
-    s = safe_identifier(name)
-    return f'`{s}`' if s else ''
-
-
-# ---------------------------------------------------------------------------
-# Node 1: extract_intent_and_execute
-# ---------------------------------------------------------------------------
-
-async def extract_intent_and_execute_node(state: MetricChatState) -> dict:
-    connection_string = state.get('connection_string')
-    conversation = state.get('conversation', [])
-    selected = state.get('selected_tables', [])
-    db_operation_note = ''
-    render_blocks: dict[str, str] = {}
-
-    if not connection_string:
-        return {'db_operation_note': db_operation_note, 'render_blocks': render_blocks}
-
-    db_intent = await extract_db_intent_from_model(conversation, LLM_API_KEY)
-
-    if not db_intent.get('intent'):
-        return {'db_operation_note': db_operation_note, 'render_blocks': render_blocks}
-
-    intent = db_intent['intent']
-    params = db_intent.get('params', {})
-    db = safe_identifier(params.get('database')) or None
-    tbl = safe_identifier(params.get('table')) or None
-    full_tbl = ''
-    if tbl:
-        full_tbl = f'{_esc(db)}.{_esc(tbl)}' if db else _esc(tbl)
-
-    # ── describeTable: schema + preview ──
-    if intent == 'describeTable':
-        schema_result = await run_database_operation(connection_string, 'describeTable', params)
-        preview_result = await run_database_operation(connection_string, 'previewData', {**params, 'limit': 10})
-
-        available = []
-        return_codes = []
-
-        if schema_result['ok']:
-            cols = schema_result['data'].get('columns') or []
-            table_schema = rows_to_markdown_table(cols, ['Field', 'Type', 'Null', 'Key', 'Default', 'Extra'])
-            return_codes.append(f'DESCRIBE 执行成功，返回列数: {len(cols)}')
-            render_blocks['SQL_SCHEMA'] = f'```sql\nDESCRIBE {full_tbl};\n```'
-            render_blocks['TABLE_SCHEMA'] = table_schema
-            available.append(f'SQL_SCHEMA: DESCRIBE语句')
-            available.append(f'TABLE_SCHEMA: 表结构({len(cols)}列)')
-        else:
-            err = schema_result.get('error', '')
-            return_codes.append(f'DESCRIBE 执行失败: {err}')
-            render_blocks['ERR_SCHEMA'] = f'**表结构查询失败**：{err}'
-            available.append('ERR_SCHEMA: 表结构查询失败信息')
-
-        if preview_result['ok']:
-            rows = preview_result['data'].get('rows') or []
-            table_preview = rows_to_markdown_table(rows)
-            return_codes.append(f'SELECT 执行成功，返回行数: {len(rows)}')
-            render_blocks['SQL_PREVIEW'] = f'```sql\nSELECT * FROM {full_tbl} LIMIT 10;\n```'
-            render_blocks['DATA_PREVIEW'] = table_preview
-            available.append('SQL_PREVIEW: SELECT预览语句')
-            available.append(f'DATA_PREVIEW: 前10条数据({len(rows)}行)')
-
-        render_blocks['RETURN_CODE'] = '；'.join(return_codes)
-        available.append('RETURN_CODE: SQL返回码')
-
-        db_operation_note = (
-            f'\n\n**【数据库操作结果】** 已查询表 {full_tbl} 的结构和数据预览。\n'
-            f'可用数据块：\n' + '\n'.join(f'- {a}' for a in available)
-        )
-        return {'db_operation_note': db_operation_note, 'render_blocks': render_blocks}
-
-    # ── All other intents ──
-    op_result = await run_database_operation(connection_string, intent, params)
-
-    if op_result['ok']:
-        d = op_result['data']
-        available = []
-
-        if intent == 'listDatabases':
-            databases = d.get('databases') or []
-            if len(selected) > 0:
-                selected_dbs = set(s.split('.')[0] for s in selected)
-                databases = [item for item in databases if item.get('database') in selected_dbs]
-            table = rows_to_markdown_table(databases, ['database', 'tableCount'])
-            code = f'返回数据库数: {len(databases)}'
-            render_blocks['TABLE_1'] = table
-            render_blocks['RETURN_CODE'] = code
-            available.append(f'TABLE_1: 数据库列表({len(databases)}个)')
-            available.append('RETURN_CODE: SQL返回码')
-
-        elif intent == 'listTables':
-            tables = d.get('tables') or []
-            if len(selected) > 0 and db:
-                allowed_tables = set(
-                    s.split('.')[1] for s in selected if s.startswith(db + '.')
-                )
-                if len(allowed_tables) > 0:
-                    tables = [t for t in tables if t in allowed_tables]
-            rows = [{'表名': t} for t in tables]
-            table = rows_to_markdown_table(rows, ['表名'])
-            code = f'返回表数量: {len(tables)}'
-            render_blocks['TABLE_1'] = table
-            render_blocks['RETURN_CODE'] = code
-            available.append(f'TABLE_1: 表列表({len(tables)}个)')
-            available.append('RETURN_CODE: SQL返回码')
-
-        elif intent == 'previewData':
-            table = rows_to_markdown_table(d.get('rows') or [])
-            row_count = d.get('rowCount') if d.get('rowCount') is not None else len(d.get('rows') or [])
-            code = f'返回行数: {row_count}'
-            render_blocks['TABLE_1'] = table
-            render_blocks['RETURN_CODE'] = code
-            available.append(f'TABLE_1: 数据预览({row_count}行)')
-            available.append('RETURN_CODE: SQL返回码')
-
-        elif intent == 'analyzeNulls':
-            table = rows_to_markdown_table(d.get('columns') or [], ['column', 'nullCount', 'nullRate'])
-            total_rows = d.get('totalRows', '-')
-            code = f'总行数: {total_rows}'
-            render_blocks['TABLE_1'] = table
-            render_blocks['RETURN_CODE'] = code
-            available.append(f'TABLE_1: 空值统计表')
-            available.append('RETURN_CODE: SQL返回码')
-
-        elif intent == 'executeSQL' and d.get('rows') is not None and len(d.get('rows', [])) > 0:
-            sql = str(params.get('sql') or '').strip()
-            table = rows_to_markdown_table(d['rows'])
-            exec_code = (d.get('executionSummary') or {}).get('message') or f'执行成功，返回行数: {len(d["rows"])}'
-            render_blocks['SQL_1'] = f'```sql\n{sql}\n```'
-            render_blocks['TABLE_1'] = table
-            render_blocks['RETURN_CODE'] = exec_code
-            available.append('SQL_1: 执行的SQL')
-            available.append(f'TABLE_1: 查询结果({len(d["rows"])}行)')
-            available.append('RETURN_CODE: SQL返回码')
-
-        elif intent == 'executeSQL':
-            sql = str(params.get('sql') or '').strip()
-            exec_code = (d.get('executionSummary') or {}).get('message') or '执行完成。'
-            render_blocks['SQL_1'] = f'```sql\n{sql}\n```'
-            render_blocks['RETURN_CODE'] = exec_code
-            available.append('SQL_1: 执行的SQL')
-            available.append('RETURN_CODE: SQL返回码')
-
-        elif intent == 'createTable':
-            render_blocks['RESULT'] = d.get('message') or '表已创建'
-            available.append('RESULT: 建表结果')
-
-        elif intent == 'createDatabase':
-            render_blocks['RESULT'] = d.get('message') or '数据库已创建'
-            available.append('RESULT: 建库结果')
-
-        else:
-            render_blocks['DATA_JSON'] = f'```json\n{json.dumps(d, ensure_ascii=False, indent=2)}\n```'
-            available.append('DATA_JSON: 返回数据')
-
-        db_operation_note = (
-            f'\n\n**【数据库操作结果】** 执行「{intent}」**成功**。\n'
-            f'可用数据块：\n' + '\n'.join(f'- {a}' for a in available)
-        )
-
-    else:
-        err_msg = op_result.get('error') or ''
-
-        # Column-name error auto-correction
-        schema_block = ''
-        is_column_error = bool(re.search(
-            r"column\s+['\`]?\w+['\`]?\s+does not exist|Unknown column|doesn't have column",
-            err_msg,
-            re.IGNORECASE,
-        ))
-        if intent == 'executeSQL' and is_column_error and params.get('sql'):
-            table_refs = extract_table_refs_from_sql(params['sql'])
-            block_idx = 1
-            schema_avail = []
-            for ref in table_refs:
-                desc = await run_database_operation(
-                    connection_string, 'describeTable',
-                    {'database': ref.get('database'), 'table': ref['table']},
-                )
-                if desc['ok'] and desc.get('data') and desc['data'].get('columns'):
-                    full_name = (
-                        f'{ref["database"]}.{ref["table"]}' if ref.get('database') else ref['table']
-                    )
-                    table_schema = rows_to_markdown_table(
-                        desc['data']['columns'],
-                        ['Field', 'Type', 'Null', 'Key', 'Default', 'Extra'],
-                    )
-                    bid = f'FIX_SCHEMA_{block_idx}'
-                    render_blocks[bid] = f'**表 {full_name} 的真实结构**：\n{table_schema}'
-                    schema_avail.append(f'- {bid}: 表 {full_name} 的结构({len(desc["data"]["columns"])}列)')
-                    block_idx += 1
-            if len(schema_avail) > 0:
-                schema_block = (
-                    f'\n\n**【自我纠正】** 已自动查询涉及表的结构。'
-                    f'请根据真实列名给出修正后的 SQL。\n\n'
-                    '可用数据块（使用 {{BLOCK_ID}} 引用）：\n' + '\n'.join(schema_avail)
-                )
-
-        db_operation_note = (
-            f'\n\n**【数据库操作结果】** 执行「{intent}」**失败**。\n'
-            f'**失败原因**：{err_msg}\n'
-            f'请如实告知用户失败原因并给出修改建议。{schema_block}'
-        )
-
-    if render_blocks:
-        logger.info("[DB] intent=%s blocks=%s", intent, list(render_blocks.keys()))
-
-    return {'db_operation_note': db_operation_note, 'render_blocks': render_blocks}
-
-
-# ---------------------------------------------------------------------------
-# Node 2: fetch_schema_context
+# Node 1: fetch_schema_context (保持不变)
 # ---------------------------------------------------------------------------
 
 async def fetch_schema_context_node(state: MetricChatState) -> dict:
@@ -264,7 +42,6 @@ async def fetch_schema_context_node(state: MetricChatState) -> dict:
         return {'schema_context': schema_context}
 
     if len(selected) > 0:
-        # Query DESCRIBE for each selected table
         schema_lines = []
         for tbl in selected:
             parts = tbl.split('.')
@@ -286,7 +63,6 @@ async def fetch_schema_context_node(state: MetricChatState) -> dict:
                 f'{chr(10).join(schema_lines)}'
             )
     else:
-        # Full scan
         try:
             db_result = await run_database_operation(connection_string, 'listDatabases', {})
             if db_result['ok']:
@@ -322,21 +98,24 @@ async def fetch_schema_context_node(state: MetricChatState) -> dict:
                 if len(schema_lines) > 0:
                     schema_context = f'\n\n**可用表结构**：\n{chr(10).join(schema_lines)}'
         except Exception:
-            pass  # ignore schema fetch errors
+            pass
 
     return {'schema_context': schema_context}
 
 
 # ---------------------------------------------------------------------------
-# Node 3: build_prompt_and_call_llm
+# Node 2: tool_calling_loop_node
 # ---------------------------------------------------------------------------
 
-async def build_prompt_and_call_llm_node(state: MetricChatState) -> dict:
+async def tool_calling_loop_node(state: MetricChatState) -> dict:
+    """调用 LLM（带 execute_sql 工具），循环处理 tool calls。"""
     conversation = state.get('conversation', [])
+    connection_string = state.get('connection_string')
     selected = state.get('selected_tables', [])
     schema_context = state.get('schema_context', '')
-    db_operation_note = state.get('db_operation_note', '')
-    render_blocks = state.get('render_blocks', {})
+
+    render_blocks = {}
+    block_counter = [1]
 
     selected_tables_restriction = ''
     if len(selected) > 0:
@@ -350,6 +129,8 @@ async def build_prompt_and_call_llm_node(state: MetricChatState) -> dict:
     system_prompt = f"""你是一个智能数据助手，同时具备**数据加工（ETL）**和**指标定义**两种能力。
 {selected_tables_restriction}
 
+**你有一个工具 `execute_sql`**，可以在用户的 MySQL 数据库上执行任意 SQL。需要查数据、建库、建表、写入数据时，直接调用工具执行 SQL 即可。你可以多次调用工具来完成多步操作。
+
 ## 能力一：数据加工（ETL）
 你可以帮助用户完成完整的数据库操作，包括：
 - 查看数据库列表、表列表、表结构、数据预览
@@ -359,11 +140,11 @@ async def build_prompt_and_call_llm_node(state: MetricChatState) -> dict:
 - 字段映射与数据加工（INSERT INTO ... SELECT）
 
 **数据库操作规则**：
-- 所有会修改库表或数据的操作（DDL、DML）必须先展示完整 SQL 并获用户确认后才能执行
-- 只读操作（SELECT、DESCRIBE、SHOW）可直接执行
+- 所有会修改库表或数据的操作（DDL、DML）必须先展示完整 SQL 并获用户确认后才能调用工具执行
+- 只读操作（SELECT、DESCRIBE、SHOW）可直接调用工具执行
 - 所有 SQL 必须严格符合 MySQL 语法
 - 展示数据时必须用 markdown 表格，禁止 JSON
-- 若有【数据库操作结果】，必须如实展示，不得编造
+- 若工具执行失败，必须如实展示失败原因，不得声称成功
 
 ## 能力二：指标定义
 你可以帮助用户定义纯度量指标（不含维度）：
@@ -383,30 +164,30 @@ async def build_prompt_and_call_llm_node(state: MetricChatState) -> dict:
 - 两种能力可以混合使用，比如用户可能先查看表结构再定义指标
 
 {schema_context}
-{db_operation_note}
 
 **【数据块引用机制】**：
-当【数据库操作结果】中列出了「可用数据块」时，你**必须使用 `{{BLOCK_ID}}` 占位符**来引用数据，**严禁**自己手写或复制表格/SQL内容。
-后端会自动将 `{{BLOCK_ID}}` 替换为真实内容。只引用已列出的 BLOCK_ID，不要编造不存在的 ID。
+execute_sql 工具返回的结果中会包含「数据块 ID」（如 TABLE_1、SQL_1），这些 ID 对应真实的查询结果数据。
+你在最终回复中**必须使用 `{{BLOCK_ID}}` 占位符**来引用这些数据，**严禁**自己手写或复制表格/SQL内容。
+后端会自动将 `{{BLOCK_ID}}` 替换为真实内容。只引用工具返回中列出的数据块 ID，不要编造不存在的 ID。
 
 **回复规则**：
 - 用中文回复，简洁友好
-- 若有【数据库操作结果】且为失败，必须如实输出失败原因
-- 若有【数据库操作结果】且为成功，必须以 markdown 表格展示数据。有「可用数据块」时用 {{BLOCK_ID}} 引用
-- 若本轮没有【数据库操作结果】，不得声称已执行任何数据库操作
+- 若工具执行失败，必须如实输出失败原因，不得声称成功
+- 若工具执行成功，必须以 markdown 表格展示数据。用 {{BLOCK_ID}} 引用数据块
 - 所有写操作（CREATE TABLE、INSERT 等）必须先展示 SQL 并提示用户确认
+- **凡涉及表数据展示的回答**，回复中**禁止出现 JSON**，必须用「SQL 代码块 + markdown 表格 + 返回码」三部分展示
+- 表格内容必须与工具返回结果完全一致，不得编造
 
 **输出格式**：只返回一个 JSON 对象，不要 markdown 代码块：
 
 当还在讨论或执行数据库操作时：
-{{"reply":"你的回复（可含 markdown，有可用数据块时用 {{BLOCK_ID}} 引用）"}}
+{{"reply":"你的回复（可含 markdown，用 {{BLOCK_ID}} 引用数据块）"}}
 
 当用户确认指标后（用户明确说确认/可以/没问题）：
 {{"reply":"指标已创建：xxx","metricDef":{{"name":"指标名称","definition":"指标计算逻辑描述","tables":["db.table1"],"aggregation":"SUM","measureField":"amount"}}}}
 
 **aggregation 可选值**：SUM、COUNT、AVG、COUNT_DISTINCT、MAX、MIN
 **measureField**：被聚合的字段名
-
 **重要**：只有用户明确确认后才返回 metricDef。讨论阶段不要返回 metricDef。"""
 
     messages = [
@@ -414,19 +195,83 @@ async def build_prompt_and_call_llm_node(state: MetricChatState) -> dict:
         *[{'role': t['role'], 'content': t['content']} for t in conversation],
     ]
 
-    result = await call_llm(messages, temperature=0.3, max_tokens=4096, caller="metric_chat")
+    tools = SQL_TOOLS if connection_string else None
 
-    if not result.get('ok'):
+    MAX_TOOL_ROUNDS = 5
+    try:
+        for round_i in range(MAX_TOOL_ROUNDS):
+            result = await call_llm(
+                messages, tools=tools,
+                temperature=0.3, max_tokens=4096,
+                caller=f"metric_chat_r{round_i}",
+            )
+
+            if not result.get('ok'):
+                return {
+                    'llm_response': {
+                        '_error': result.get('error') or '指标对话失败',
+                        '_status': result.get('status', 500),
+                    }
+                }
+
+            tool_calls = result.get('tool_calls')
+
+            if not tool_calls:
+                return _process_metric_response(
+                    result.get('content', ''), render_blocks,
+                )
+
+            messages.append({
+                'role': 'assistant',
+                'content': result.get('content'),
+                'tool_calls': [
+                    {
+                        'id': tc.id,
+                        'type': 'function',
+                        'function': {
+                            'name': tc.function.name,
+                            'arguments': tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
+
+            for tc in tool_calls:
+                logger.info("[Tool] call: %s args=%s", tc.function.name, tc.function.arguments[:200])
+                tool_result = await execute_tool_call(
+                    tc, connection_string, render_blocks, block_counter,
+                )
+                logger.info("[Tool] result: %s", tool_result[:200])
+                messages.append({
+                    'role': 'tool',
+                    'tool_call_id': tc.id,
+                    'content': tool_result,
+                })
+
+        # 超过最大轮次
+        result = await call_llm(
+            messages, temperature=0.3, max_tokens=4096,
+            caller="metric_chat_final",
+        )
+        content = result.get('content', '') if result.get('ok') else '对话处理超时，请重试。'
+        return _process_metric_response(content, render_blocks)
+
+    except Exception as e:
+        logger.error("[Metric] tool_calling_loop error: %s", e)
         return {
             'llm_response': {
-                '_error': result.get('error') or '指标对话失败',
-                '_status': result.get('status', 500),
-            },
+                '_error': str(e) or '指标对话失败',
+                '_status': 500,
+            }
         }
 
-    content = (result.get('content') or '').strip()
+
+def _process_metric_response(content, render_blocks):
+    """处理 LLM 最终回复：解析 JSON、替换占位符。"""
+    content = (content or '').strip()
     json_match = re.search(r'\{[\s\S]*\}', content)
-    out: dict = {'reply': content}
+    out = {'reply': content}
     if json_match:
         try:
             parsed = json.loads(json_match.group(0))
@@ -437,7 +282,6 @@ async def build_prompt_and_call_llm_node(state: MetricChatState) -> dict:
         except (json.JSONDecodeError, ValueError):
             pass
 
-    # Replace {BLOCK_ID} / {{BLOCK_ID}} placeholders with actual content
     if render_blocks:
         reply = out['reply']
         for bid, content_val in render_blocks.items():
@@ -445,8 +289,9 @@ async def build_prompt_and_call_llm_node(state: MetricChatState) -> dict:
             reply = reply.replace('{' + bid + '}', content_val)
         out['reply'] = reply
 
-    logger.info("[Metric] reply_len=%d has_metricDef=%s blocks_replaced=%s",
-                len(out['reply']), 'metricDef' in out, list(render_blocks.keys()) if render_blocks else [])
+    logger.info("[Metric] reply_len=%d has_metricDef=%s blocks=%s",
+                len(out['reply']), 'metricDef' in out,
+                list(render_blocks.keys()) if render_blocks else [])
 
     return {'llm_response': out}
 
@@ -457,13 +302,11 @@ async def build_prompt_and_call_llm_node(state: MetricChatState) -> dict:
 
 def build_metric_chat_graph():
     graph = StateGraph(MetricChatState)
-    graph.add_node("extract_intent_and_execute", extract_intent_and_execute_node)
     graph.add_node("fetch_schema_context", fetch_schema_context_node)
-    graph.add_node("build_prompt_and_call_llm", build_prompt_and_call_llm_node)
+    graph.add_node("tool_calling_loop", tool_calling_loop_node)
 
-    graph.set_entry_point("extract_intent_and_execute")
-    graph.add_edge("extract_intent_and_execute", "fetch_schema_context")
-    graph.add_edge("fetch_schema_context", "build_prompt_and_call_llm")
-    graph.add_edge("build_prompt_and_call_llm", END)
+    graph.set_entry_point("fetch_schema_context")
+    graph.add_edge("fetch_schema_context", "tool_calling_loop")
+    graph.add_edge("tool_calling_loop", END)
 
     return graph.compile()
