@@ -36,6 +36,14 @@ export interface ChatApiResponse {
   currentStep?: number;
   /** 指标操作指令，当后端检测到指标意图时返回 */
   metricAction?: MetricAction;
+  /** 后端在 INSERT 成功时返回的结构化加工表信息 */
+  processedTable?: {
+    database: string;
+    table: string;
+    insertSql: string;
+    sourceTables: string[];
+    fieldMappings: { targetField: string; sourceTable: string; sourceExpr: string; transform: string }[];
+  };
 }
 
 export async function fetchChatWithModel(

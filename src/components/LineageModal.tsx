@@ -32,11 +32,11 @@ function LineageDiagram({ data }: { data: LineageResponse }) {
   const targetFields = mappings.map(m => m.targetField);
 
   // Layout
-  const colW = 200;
+  const colW = 220;
   const fieldH = 22;
   const headerH = 36;
   const padY = 8;
-  const gapX = 220;
+  const gapX = 360;
   const sourceX = 30;
   const targetX = sourceX + colW + gapX;
 
@@ -82,34 +82,60 @@ function LineageDiagram({ data }: { data: LineageResponse }) {
         </marker>
       </defs>
 
-      {/* Connection lines */}
-      {lines.map((l, i) => {
-        const midX = (l.x1 + l.x2) / 2;
-        const isDirect = l.transform === '直接映射';
-        return (
-          <g key={`line-${i}`}>
-            <path
-              d={`M${l.x1},${l.y1} C${midX},${l.y1} ${midX},${l.y2} ${l.x2},${l.y2}`}
-              fill="none" stroke="#6366f1" strokeWidth="1.2"
-              strokeDasharray={isDirect ? 'none' : '5 3'}
-              markerEnd="url(#lm-arrow)" opacity="0.5"
-            />
-            {!isDirect && (
-              <g>
-                <rect
-                  x={midX - 36} y={(l.y1 + l.y2) / 2 - 9}
-                  width={72} height={18} rx="9"
-                  fill="#eef2ff" stroke="#c7d2fe" strokeWidth="0.8"
-                />
-                <text x={midX} y={(l.y1 + l.y2) / 2 + 3}
-                  textAnchor="middle" fontSize="9" fill="#4338ca" fontWeight="500">
-                  {l.transform.length > 10 ? l.transform.slice(0, 10) + '…' : l.transform}
-                </text>
-              </g>
-            )}
-          </g>
-        );
-      })}
+      {/* Connection lines with labels */}
+      {(() => {
+        // 计算所有非直接取值标签的位置，做防重叠
+        const labelH = 22;
+        const labelPositions: { x: number; y: number; text: string; lineIdx: number }[] = [];
+        lines.forEach((l, i) => {
+          const isDirect = l.transform === '直接映射' || l.transform === '直接取值';
+          if (isDirect) return;
+          const midX = (l.x1 + l.x2) / 2;
+          let labelY = (l.y1 + l.y2) / 2;
+          // 避免与已有标签重叠
+          for (let attempt = 0; attempt < 20; attempt++) {
+            const overlap = labelPositions.some(
+              p => Math.abs(p.x - midX) < 120 && Math.abs(p.y - labelY) < labelH
+            );
+            if (!overlap) break;
+            labelY += labelH;
+          }
+          labelPositions.push({ x: midX, y: labelY, text: l.transform, lineIdx: i });
+        });
+
+        return lines.map((l, i) => {
+          const midX = (l.x1 + l.x2) / 2;
+          const isDirect = l.transform === '直接映射' || l.transform === '直接取值';
+          const labelInfo = labelPositions.find(p => p.lineIdx === i);
+          // 截断显示文本
+          const displayText = l.transform.length > 20 ? l.transform.slice(0, 20) + '…' : l.transform;
+          const rectW = Math.min(displayText.length * 9 + 16, 200);
+
+          return (
+            <g key={`line-${i}`}>
+              <path
+                d={`M${l.x1},${l.y1} C${midX},${l.y1} ${midX},${l.y2} ${l.x2},${l.y2}`}
+                fill="none" stroke={isDirect ? '#94a3b8' : '#6366f1'} strokeWidth="1.2"
+                strokeDasharray={isDirect ? 'none' : '5 3'}
+                markerEnd="url(#lm-arrow)" opacity={isDirect ? 0.3 : 0.5}
+              />
+              {labelInfo && (
+                <g>
+                  <rect
+                    x={labelInfo.x - rectW / 2} y={labelInfo.y - 10}
+                    width={rectW} height={20} rx="10"
+                    fill="#eef2ff" stroke="#c7d2fe" strokeWidth="0.8"
+                  />
+                  <text x={labelInfo.x} y={labelInfo.y + 4}
+                    textAnchor="middle" fontSize="9" fill="#4338ca" fontWeight="500">
+                    {displayText}
+                  </text>
+                </g>
+              )}
+            </g>
+          );
+        });
+      })()}
 
       {/* Source table boxes */}
       {sourceBoxes.map((src, si) => {
@@ -313,7 +339,7 @@ export default function LineageModal({ table, onClose, onAddMetric }: Props) {
                             <td className="px-3 py-1.5 text-slate-600">{m.sourceField}</td>
                             <td className="px-3 py-1.5">
                               <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                                m.transform === '直接映射'
+                                m.transform === '直接映射' || m.transform === '直接取值'
                                   ? 'bg-green-50 text-green-700'
                                   : 'bg-purple-50 text-purple-700'
                               }`}>

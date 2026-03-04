@@ -92,100 +92,6 @@ function looksLikeConnectionString(s: string): boolean {
   return /mysql\s+.+-h\s+/i.test(s) && (/-u\s/i.test(s) || /-u'/.test(s));
 }
 
-/** 从对话历史中提取已加工表信息（含字段映射） */
-function extractProcessedTableFromReply(reply: string, allMessages: ChatMessage[]): {
-  database: string; table: string; sourceTables: string[];
-  fieldMappings: { targetField: string; sourceTable: string; sourceExpr: string; transform: string }[];
-  insertSql: string;
-} | null {
-  // 检测 INSERT 执行成功（步骤4完成标志）
-  const insertSuccess = /执行完成|影响行数|数据已写入/i.test(reply) && /INSERT\s+INTO/i.test(reply);
-  // 检测建表成功
-  const createSuccess = /建表成功|表已创建/i.test(reply);
-
-  if (!insertSuccess && !createSuccess) return null;
-
-  // 从回复或历史消息中提取目标表名 `db`.`table` 或 db.table
-  const allText = allMessages.map(m =>
-    m.contents.filter((c): c is { type: 'text'; text: string } => c.type === 'text').map(c => c.text).join('')
-  ).join('\n') + '\n' + reply;
-
-  // 匹配 CREATE TABLE `db`.`table` 或 INSERT INTO `db`.`table`
-  const tableMatch = allText.match(/(?:CREATE\s+TABLE|INSERT\s+INTO)\s+`([^`]+)`\s*\.\s*`([^`]+)`/i);
-  if (!tableMatch) return null;
-
-  const database = tableMatch[1];
-  const table = tableMatch[2];
-
-  // 提取完整的 INSERT SQL
-  let insertSql = '';
-  const insertMatch = allText.match(/INSERT\s+INTO\s+`[^`]+`\s*\.\s*`[^`]+`[^;]*;?/i);
-  if (insertMatch) insertSql = insertMatch[0].trim();
-
-  // 提取基表来源（FROM / JOIN `db`.`table`）
-  const sourceTables: string[] = [];
-  const fromJoinMatches = allText.matchAll(/(?:FROM|JOIN)\s+`([^`]+)`\s*\.\s*`([^`]+)`/gi);
-  for (const m of fromJoinMatches) {
-    const src = `${m[1]}.${m[2]}`;
-    if (src !== `${database}.${table}` && !sourceTables.includes(src)) {
-      sourceTables.push(src);
-    }
-  }
-
-  // 提取字段映射：从 INSERT INTO ... (fields) SELECT ... 中解析
-  const fieldMappings: { targetField: string; sourceTable: string; sourceExpr: string; transform: string }[] = [];
-
-  // 提取目标字段列表
-  const insertFieldsMatch = insertSql.match(/INSERT\s+INTO\s+`[^`]+`\s*\.\s*`[^`]+`\s*\(([^)]+)\)/i);
-  // 提取 SELECT 部分
-  const selectMatch = insertSql.match(/SELECT\s+([\s\S]+?)\s+FROM\s+/i);
-
-  if (insertFieldsMatch && selectMatch) {
-    const targetFields = insertFieldsMatch[1].split(',').map(f => f.trim().replace(/`/g, ''));
-    const selectExprs = splitSelectExprs(selectMatch[1]);
-
-    for (let i = 0; i < targetFields.length && i < selectExprs.length; i++) {
-      const expr = selectExprs[i].trim();
-      // 判断是否有聚合函数
-      const aggMatch = expr.match(/^(SUM|COUNT|AVG|MAX|MIN|GROUP_CONCAT)\s*\(/i);
-      const transform = aggMatch ? aggMatch[1].toUpperCase() : '直接映射';
-
-      // 提取来源字段（简单匹配 `field` 或 alias.`field`）
-      const fieldRef = expr.match(/`([^`]+)`\s*\)/i) || expr.match(/`([^`]+)`/i);
-      const sourceExpr = fieldRef ? fieldRef[1] : expr.replace(/\s+AS\s+\w+$/i, '').trim();
-
-      // 尝试匹配来源表
-      const tableRef = expr.match(/`([^`]+)`\s*\.\s*`([^`]+)`/);
-      const sourceTable = tableRef
-        ? `${tableRef[1]}.${tableRef[2]}`
-        : sourceTables.length > 0 ? sourceTables[0] : '';
-
-      fieldMappings.push({ targetField: targetFields[i], sourceTable, sourceExpr, transform });
-    }
-  }
-
-  return { database, table, sourceTables, fieldMappings, insertSql };
-}
-
-/** 拆分 SELECT 表达式列表（处理嵌套括号内的逗号） */
-function splitSelectExprs(selectPart: string): string[] {
-  const result: string[] = [];
-  let depth = 0;
-  let current = '';
-  for (const ch of selectPart) {
-    if (ch === '(') depth++;
-    else if (ch === ')') depth--;
-    if (ch === ',' && depth === 0) {
-      result.push(current);
-      current = '';
-    } else {
-      current += ch;
-    }
-  }
-  if (current.trim()) result.push(current);
-  return result;
-}
-
 function wantsDemoGuide(text: string): boolean {
   const t = text.trim();
   return /操作指南|看演示|看指南|^演示$|^指南$/.test(t) || /^[1一]\.?\s*看/.test(t);
@@ -322,21 +228,19 @@ export const useStore = create<AppState>((set, get) => ({
         set(updates);
         persistState({ ...get(), ...updates } as any);
 
-        // 检测是否有新的已加工表
+        // 检测是否有新的已加工表（由后端结构化返回）
         const dashId = get().dashboardId;
-        if (dashId) {
-          const processed = extractProcessedTableFromReply(res.reply, get().messages);
-          if (processed) {
-            useProcessedTableStore.getState().addOrUpdate({
-              dashboardId: dashId,
-              database: processed.database,
-              table: processed.table,
-              sourceTables: processed.sourceTables,
-              fieldMappings: processed.fieldMappings,
-              insertSql: processed.insertSql,
-              processedAt: Date.now(),
-            });
-          }
+        if (dashId && res.processedTable) {
+          const pt = res.processedTable;
+          useProcessedTableStore.getState().addOrUpdate({
+            dashboardId: dashId,
+            database: pt.database,
+            table: pt.table,
+            sourceTables: pt.sourceTables,
+            fieldMappings: pt.fieldMappings || [],
+            insertSql: pt.insertSql,
+            processedAt: Date.now(),
+          });
         }
       } catch (err) {
         const updatedMessages = [...get().messages];

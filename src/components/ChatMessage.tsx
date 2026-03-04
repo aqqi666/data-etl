@@ -1,6 +1,35 @@
 import { Database, User } from 'lucide-react';
 import type { ChatMessage as Msg, ContentBlock } from '../types';
 
+/** 检测未被 ``` 包裹的裸 SQL 块，自动包裹为 ```sql ... ``` */
+function autoWrapSql(text: string): string {
+  // 如果已经在代码块内就跳过
+  const parts: string[] = [];
+  const codeBlockRe = /```[\s\S]*?```/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = codeBlockRe.exec(text)) !== null) {
+    if (m.index > last) parts.push(wrapBareSql(text.slice(last, m.index)));
+    parts.push(m[0]); // 保留已有代码块
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) parts.push(wrapBareSql(text.slice(last)));
+  return parts.join('');
+}
+
+function wrapBareSql(text: string): string {
+  // 匹配以 SQL 关键字开头、跨多行的裸 SQL 语句（至少 2 行，以分号或末尾结束）
+  return text.replace(
+    /^([ \t]*(?:INSERT\s+INTO|SELECT\s+|CREATE\s+(?:TABLE|DATABASE)|DESCRIBE|SHOW\s+|ALTER\s+TABLE)\b[\s\S]*?);?\s*$/gim,
+    (match) => {
+      const trimmed = match.trim();
+      // 只包裹多行 SQL（至少包含换行）
+      if (!trimmed.includes('\n')) return match;
+      return `\n\`\`\`sql\n${trimmed}\n\`\`\`\n`;
+    },
+  );
+}
+
 function renderInlineMarkdown(text: string) {
   const parts = text.split(/(\*\*.*?\*\*|`[^`]+`)/g);
   return parts.map((part, i) => {
@@ -62,20 +91,22 @@ function MarkdownTable({ header, rows }: { header: string[]; rows: string[][] })
 }
 
 function TextBlock({ text }: { text: string }) {
+  // 先将未被 ``` 包裹的裸 SQL 块自动包裹为代码块
+  const preprocessed = autoWrapSql(text);
   const codeBlockRegex = /```(\w*)\n([\s\S]*?)```/g;
   const segments: { type: 'text' | 'code'; content: string; lang?: string }[] = [];
   let lastIndex = 0;
   let match;
 
-  while ((match = codeBlockRegex.exec(text)) !== null) {
+  while ((match = codeBlockRegex.exec(preprocessed)) !== null) {
     if (match.index > lastIndex) {
-      segments.push({ type: 'text', content: text.slice(lastIndex, match.index) });
+      segments.push({ type: 'text', content: preprocessed.slice(lastIndex, match.index) });
     }
     segments.push({ type: 'code', content: match[2].trim(), lang: match[1] || 'sql' });
     lastIndex = match.index + match[0].length;
   }
-  if (lastIndex < text.length) {
-    segments.push({ type: 'text', content: text.slice(lastIndex) });
+  if (lastIndex < preprocessed.length) {
+    segments.push({ type: 'text', content: preprocessed.slice(lastIndex) });
   }
 
   return (
