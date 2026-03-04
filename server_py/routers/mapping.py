@@ -11,7 +11,7 @@ router = APIRouter()
 def build_system_prompt(target_table_name, target_fields, existing_mappings):
     mapped = [m for m in existing_mappings if m.get('status') != 'unmapped']
     field_list = '\n'.join(
-        f'- {f["name"]} ({f["type"]}) {f"— {f["comment"]}" if f.get("comment") else ""}'
+        f'- {f["name"]} ({f["type"]}) {"— " + f["comment"] if f.get("comment") else ""}'
         for f in target_fields
     )
 

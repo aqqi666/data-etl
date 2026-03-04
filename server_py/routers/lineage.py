@@ -115,11 +115,12 @@ def _build_lineage_from_structured_data(
     # 提取 JOIN 关系
     join_rels_raw = _extract_join_relations(sql)
 
+    # 构建别名映射（alias → full_name）
+    alias_map = _extract_alias_map(sql, ref_map)
+
     # 构建 sourceTables
     built_sources = []
-    # 从引用信息构建
     for full_name, info in ref_map.items():
-        # 找到对应的 JOIN 关系
         join_type = '无（主表）'
         join_cond = ''
         for jr in join_rels_raw:
@@ -134,7 +135,6 @@ def _build_lineage_from_structured_data(
             'joinType': join_type if info['role'] == '维表' else '无（主表）',
             'joinCondition': join_cond if info['role'] == '维表' else '',
         })
-    # 如果 SQL 解析没拿到表但 source_tables 有，补充
     existing_names = {s['name'] for s in built_sources}
     for st in source_tables:
         if st not in existing_names and st != target_table:
@@ -143,20 +143,35 @@ def _build_lineage_from_structured_data(
                 'joinType': '无（主表）', 'joinCondition': '',
             })
 
-    # 构建 fieldMappings
+    # 解析 SELECT 表达式列表，用于生成自然语言描述
+    select_exprs = _extract_select_expressions(sql)
+
+    # 构建 fieldMappings（带自然语言 transform）
     built_field_mappings = []
     for fm in field_mappings:
+        target_field = fm.get('targetField', '')
+        source_expr = fm.get('sourceExpr', '')
+        raw_transform = fm.get('transform', '直接映射')
+
+        # 找到该字段对应的完整 SQL 表达式
+        full_expr = _find_expr_for_field(target_field, select_exprs)
+
+        # 生成自然语言描述
+        transform_desc = _describe_transform(
+            target_field, source_expr, full_expr, raw_transform,
+            fm.get('sourceTable', ''), built_sources, join_rels_raw, alias_map,
+        )
+
         built_field_mappings.append({
-            'targetField': fm.get('targetField', ''),
+            'targetField': target_field,
             'sourceTable': fm.get('sourceTable', ''),
-            'sourceField': fm.get('sourceExpr', ''),
-            'transform': fm.get('transform', '直接映射'),
-            'expression': fm.get('sourceExpr', ''),
+            'sourceField': source_expr,
+            'transform': transform_desc,
+            'expression': full_expr or source_expr,
         })
 
-    # 构建 joinRelations（从解析结果）
+    # 构建 joinRelations
     built_joins = []
-    # 找主表
     main_table = ''
     for s in built_sources:
         if s['role'] == '基表':
@@ -164,7 +179,6 @@ def _build_lineage_from_structured_data(
             break
     for jr in join_rels_raw:
         right = jr['rightTable']
-        # 尝试匹配全名
         for s in built_sources:
             if s['name'].lower() == right.lower() or s['name'].lower().endswith('.' + right.lower()):
                 right = s['name']
@@ -184,6 +198,179 @@ def _build_lineage_from_structured_data(
         'groupBy': _extract_sql_clause(sql, 'GROUP BY'),
         'filters': _extract_sql_clause(sql, 'WHERE'),
     }
+
+
+def _extract_alias_map(sql: str, ref_map: dict) -> dict:
+    """从 SQL 中提取表别名映射：alias → full_table_name"""
+    alias_map = {}
+    # 匹配 FROM/JOIN table AS alias 或 FROM/JOIN table alias
+    pattern = re.compile(
+        r'(?:FROM|JOIN)\s+'
+        r'(?:`[^`]+`\.`[^`]+`|[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+|`[^`]+`|[a-zA-Z0-9_]+)'
+        r'(?:\s+(?:AS\s+)?([a-zA-Z0-9_]+))',
+        re.IGNORECASE,
+    )
+    # 更精确地提取：先找表名再找别名
+    table_alias_re = re.compile(
+        r'(?:FROM|JOIN)\s+'
+        r'(?:`([^`]+)`\.`([^`]+)`|([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)|`([^`]+)`|([a-zA-Z0-9_]+))'
+        r'\s+(?:AS\s+)?([a-zA-Z0-9_]+)'
+        r'(?=\s+(?:ON|LEFT|RIGHT|INNER|CROSS|FULL|JOIN|WHERE|GROUP|ORDER|LIMIT|SET|\(|$))',
+        re.IGNORECASE,
+    )
+    for m in table_alias_re.finditer(sql):
+        db = m.group(1) or m.group(3) or ''
+        tbl = m.group(2) or m.group(4) or m.group(5) or m.group(6) or ''
+        alias = m.group(7)
+        if alias and alias.upper() not in ('ON', 'LEFT', 'RIGHT', 'INNER', 'CROSS', 'FULL', 'JOIN', 'WHERE', 'GROUP', 'ORDER', 'SET'):
+            full_name = f'{db}.{tbl}' if db else tbl
+            # 匹配到 ref_map 中的全名
+            for ref_full in ref_map:
+                if ref_full.lower() == full_name.lower() or ref_full.lower().endswith('.' + full_name.lower()):
+                    alias_map[alias.lower()] = ref_full
+                    break
+            if alias.lower() not in alias_map:
+                alias_map[alias.lower()] = full_name
+    return alias_map
+
+
+def _extract_select_expressions(sql: str) -> list[dict]:
+    """从 INSERT INTO ... SELECT ... 中提取每个 SELECT 表达式及其别名。"""
+    # 找到 SELECT ... FROM 之间的部分
+    m = re.search(r'\bSELECT\s+([\s\S]+?)\s+FROM\b', sql, re.IGNORECASE)
+    if not m:
+        return []
+    select_part = m.group(1).strip()
+
+    # 按逗号拆分（处理嵌套括号）
+    exprs = []
+    depth = 0
+    current = ''
+    for ch in select_part:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            exprs.append(current.strip())
+            current = ''
+        else:
+            current += ch
+    if current.strip():
+        exprs.append(current.strip())
+
+    result = []
+    for expr in exprs:
+        # 提取 AS alias
+        alias_match = re.search(r'\s+AS\s+`?([a-zA-Z0-9_]+)`?\s*$', expr, re.IGNORECASE)
+        alias = alias_match.group(1) if alias_match else ''
+        raw_expr = expr[:alias_match.start()].strip() if alias_match else expr
+        result.append({'expr': raw_expr, 'alias': alias, 'full': expr})
+    return result
+
+
+def _find_expr_for_field(target_field: str, select_exprs: list[dict]) -> str:
+    """根据目标字段名找到对应的 SELECT 表达式。"""
+    tf_lower = target_field.lower()
+    for se in select_exprs:
+        if se['alias'].lower() == tf_lower:
+            return se['full']
+        # 没有 alias 时，表达式本身可能就是字段名
+        expr_field = se['expr'].rsplit('.', 1)[-1].strip('`').lower()
+        if expr_field == tf_lower and not se['alias']:
+            return se['full']
+    return ''
+
+
+def _describe_transform(
+    target_field: str,
+    source_expr: str,
+    full_expr: str,
+    raw_transform: str,
+    source_table: str,
+    sources: list[dict],
+    join_rels: list[dict],
+    alias_map: dict,
+) -> str:
+    """根据 SQL 表达式生成自然语言的加工逻辑描述。"""
+    expr = (full_expr or source_expr or '').strip()
+    expr_upper = expr.upper()
+
+    # 聚合函数
+    agg_match = re.match(r'^(SUM|COUNT|AVG|MAX|MIN|GROUP_CONCAT)\s*\(', expr, re.IGNORECASE)
+    if agg_match:
+        func = agg_match.group(1).upper()
+        inner = expr[len(func) + 1:].rstrip(')')
+        func_names = {
+            'SUM': '求和', 'COUNT': '计数', 'AVG': '求平均',
+            'MAX': '取最大值', 'MIN': '取最小值', 'GROUP_CONCAT': '拼接',
+        }
+        return f'对 {inner.strip()} {func_names.get(func, func)}'
+
+    # CASE WHEN
+    if 'CASE' in expr_upper and 'WHEN' in expr_upper:
+        return f'条件判断转换：{_simplify_expr(expr)}'
+
+    # COALESCE / IFNULL
+    if 'COALESCE' in expr_upper or 'IFNULL' in expr_upper:
+        return f'空值兜底处理：{_simplify_expr(expr)}'
+
+    # CONCAT
+    if 'CONCAT' in expr_upper:
+        return f'字符串拼接：{_simplify_expr(expr)}'
+
+    # DATE / TIME 函数
+    date_funcs = ['DATE_FORMAT', 'DATE', 'YEAR', 'MONTH', 'DAY', 'NOW', 'CURDATE', 'DATEDIFF', 'DATE_ADD', 'DATE_SUB', 'STR_TO_DATE']
+    for df in date_funcs:
+        if df in expr_upper:
+            return f'日期处理：{_simplify_expr(expr)}'
+
+    # CAST / CONVERT
+    if 'CAST' in expr_upper or 'CONVERT' in expr_upper:
+        return f'类型转换：{_simplify_expr(expr)}'
+
+    # ROUND / CEIL / FLOOR / ABS
+    math_funcs = ['ROUND', 'CEIL', 'CEILING', 'FLOOR', 'ABS', 'MOD']
+    for mf in math_funcs:
+        if mf in expr_upper:
+            return f'数值计算：{_simplify_expr(expr)}'
+
+    # 算术运算（含 / * + -）
+    if re.search(r'[+\-*/]', re.sub(r"'[^']*'", '', expr)):
+        return f'计算：{_simplify_expr(expr)}'
+
+    # 来自维表的 LEFT JOIN 关联取值 → 描述关联条件
+    if source_table:
+        for src in sources:
+            if src['name'] == source_table and src['role'] == '维表':
+                join_cond = src.get('joinCondition', '')
+                if join_cond:
+                    return f'通过关联 {source_table} 查找（{_simplify_expr(join_cond)}）'
+                return f'通过关联 {source_table} 查找获取'
+
+    # 检查表达式中的别名是否指向维表
+    alias_prefix = re.match(r'^([a-zA-Z0-9_]+)\.', expr)
+    if alias_prefix:
+        alias = alias_prefix.group(1).lower()
+        full_table = alias_map.get(alias, '')
+        if full_table:
+            for src in sources:
+                if src['name'] == full_table and src['role'] == '维表':
+                    join_cond = src.get('joinCondition', '')
+                    if join_cond:
+                        return f'通过关联 {full_table} 查找（{_simplify_expr(join_cond)}）'
+                    return f'通过关联 {full_table} 查找获取'
+
+    # 默认：直接映射
+    return '直接取值'
+
+
+def _simplify_expr(expr: str) -> str:
+    """简化 SQL 表达式用于展示，截断过长内容。"""
+    s = re.sub(r'\s+', ' ', expr).strip()
+    if len(s) > 80:
+        return s[:77] + '...'
+    return s
 
 
 def _build_metric_lineage_from_data(
@@ -376,7 +563,7 @@ async def lineage(request_body: dict):
       "targetField": "目标字段名",
       "sourceTable": "来源表全名（库名.表名）",
       "sourceField": "来源字段名",
-      "transform": "加工逻辑描述，如：直接映射、SUM聚合、COUNT计数、CASE WHEN条件转换、LEFT JOIN关联取值、COALESCE空值处理 等",
+      "transform": "用自然语言描述真实的加工逻辑。例如：直接取值、对销售额求和、通过关联公司代码表查找公司名称（ON 主表.bukrs = 公司表.bukrs）、空值时默认为0、按日期格式化为年月、条件判断：金额>0为收入否则为支出。要具体，不要只写 LEFT JOIN关联取值 这种笼统描述",
       "expression": "原始SQL表达式片段"
     }}
   ],
@@ -395,7 +582,7 @@ async def lineage(request_body: dict):
 **要求**：
 - 每个目标字段都必须追溯到具体的来源表和来源字段
 - 如果一个目标字段涉及多个来源表/字段（如 JOIN 后取值），列出主要来源
-- transform 要用中文描述清楚加工逻辑
+- transform 必须用自然语言描述真实的业务加工逻辑，要具体说明做了什么操作、为什么这样做。例如：「通过公司代码关联公司主数据表查找公司名称」「对各期间的销售额求和汇总」「当字段为空时取默认值0」。不要只写「直接映射」「LEFT JOIN关联取值」这种笼统描述
 - 维表（通过 JOIN 关联的查找表）的 role 标记为"维表"
 - 主要数据来源表的 role 标记为"基表"
 - sourceTables 必须包含 SQL 中 FROM 和所有 JOIN 涉及的表'''

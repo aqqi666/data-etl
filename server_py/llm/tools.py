@@ -4,6 +4,7 @@ import json
 import re
 import logging
 import asyncio
+from typing import Optional
 import aiomysql
 
 from db.connection import get_connection_config
@@ -53,6 +54,7 @@ async def execute_tool_call(
     connection_string: str,
     render_blocks: dict,
     block_counter: list,  # [int] 可变计数器
+    write_ops: Optional[list] = None,  # 记录成功的写操作信息
 ) -> str:
     """
     执行单个 tool_call，返回给 LLM 的文本摘要。
@@ -104,6 +106,38 @@ async def execute_tool_call(
         if is_write:
             await conn.commit()
             affected = cur.rowcount
+
+            # 记录成功的 INSERT INTO ... SELECT 操作
+            if write_ops is not None and re.match(r"^\s*INSERT\s+INTO\b", sql, re.IGNORECASE):
+                from utils.sql_parser import extract_table_refs_from_sql
+                # 提取目标表（INSERT INTO db.table）
+                target_match = (
+                    re.match(r"\s*INSERT\s+INTO\s+`([^`]+)`\s*\.\s*`([^`]+)`", sql, re.IGNORECASE)
+                    or re.match(r"\s*INSERT\s+INTO\s+([a-zA-Z0-9_]+)\s*\.\s*([a-zA-Z0-9_]+)", sql, re.IGNORECASE)
+                )
+                if target_match:
+                    target_db = target_match.group(1)
+                    target_tbl = target_match.group(2)
+                    # 提取来源表（FROM / JOIN）
+                    source_refs = extract_table_refs_from_sql(sql)
+                    source_tables = [
+                        (r["database"] + "." + r["table"]) if r.get("database") else r["table"]
+                        for r in source_refs
+                        if not (r.get("database") == target_db and r["table"] == target_tbl)
+                    ]
+                    # 提取字段映射
+                    field_mappings = _parse_field_mappings_from_sql(
+                        sql, target_db, target_tbl, source_refs,
+                    )
+                    write_ops.append({
+                        "database": target_db,
+                        "table": target_tbl,
+                        "insertSql": sql,
+                        "sourceTables": source_tables,
+                        "fieldMappings": field_mappings,
+                        "affectedRows": affected,
+                    })
+
             return (
                 f"执行成功，影响行数: {affected}。\n"
                 f"可用数据块：\n"
@@ -134,3 +168,109 @@ async def execute_tool_call(
     finally:
         if conn:
             conn.close()
+
+
+def _parse_field_mappings_from_sql(
+    sql: str, target_db: str, target_tbl: str, source_refs: list,
+) -> list:
+    """从 INSERT INTO ... SELECT SQL 中解析字段映射关系。"""
+    # 提取目标字段列表 INSERT INTO db.table (f1, f2, ...)
+    fields_match = re.search(
+        r'INSERT\s+INTO\s+[^\(]+\(([^)]+)\)', sql, re.IGNORECASE,
+    )
+    if not fields_match:
+        return []
+    target_fields = [
+        f.strip().strip('`') for f in fields_match.group(1).split(',')
+    ]
+
+    # 提取 SELECT 表达式
+    select_match = re.search(r'\bSELECT\s+([\s\S]+?)\s+FROM\b', sql, re.IGNORECASE)
+    if not select_match:
+        return []
+
+    # 按逗号拆分（处理嵌套括号）
+    select_part = select_match.group(1).strip()
+    exprs = []
+    depth = 0
+    current = ''
+    for ch in select_part:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            exprs.append(current.strip())
+            current = ''
+        else:
+            current += ch
+    if current.strip():
+        exprs.append(current.strip())
+
+    # 构建别名→全表名映射
+    alias_map = {}
+    alias_re = re.compile(
+        r'(?:FROM|JOIN)\s+'
+        r'(?:`([^`]+)`\.`([^`]+)`|([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+))'
+        r'\s+(?:AS\s+)?([a-zA-Z0-9_]+)',
+        re.IGNORECASE,
+    )
+    for m in alias_re.finditer(sql):
+        db = m.group(1) or m.group(3) or ''
+        tbl = m.group(2) or m.group(4) or ''
+        alias = m.group(5)
+        if alias and alias.upper() not in (
+            'ON', 'LEFT', 'RIGHT', 'INNER', 'JOIN', 'WHERE', 'GROUP', 'ORDER', 'SET',
+        ):
+            alias_map[alias.lower()] = f'{db}.{tbl}' if db else tbl
+
+    # 构建来源表全名列表（排除目标表）
+    source_full_names = []
+    for r in source_refs:
+        full = (r['database'] + '.' + r['table']) if r.get('database') else r['table']
+        if not (r.get('database') == target_db and r['table'] == target_tbl):
+            source_full_names.append(full)
+
+    mappings = []
+    for i, expr in enumerate(exprs):
+        if i >= len(target_fields):
+            break
+        target_field = target_fields[i]
+        expr_stripped = expr.strip()
+
+        # 去掉 AS alias
+        as_match = re.search(r'\s+AS\s+`?[a-zA-Z0-9_]+`?\s*$', expr_stripped, re.IGNORECASE)
+        raw_expr = expr_stripped[:as_match.start()].strip() if as_match else expr_stripped
+
+        # 判断加工类型
+        transform = '直接映射'
+        agg_match = re.match(r'^(SUM|COUNT|AVG|MAX|MIN)\s*\(', raw_expr, re.IGNORECASE)
+        if agg_match:
+            transform = agg_match.group(1).upper()
+        elif 'CASE' in raw_expr.upper():
+            transform = 'CASE条件转换'
+        elif 'COALESCE' in raw_expr.upper() or 'IFNULL' in raw_expr.upper():
+            transform = '空值处理'
+
+        # 提取来源表（从 alias.field 模式）
+        source_table = ''
+        alias_prefix = re.match(r'^([a-zA-Z0-9_]+)\.', raw_expr)
+        if alias_prefix:
+            alias = alias_prefix.group(1).lower()
+            source_table = alias_map.get(alias, '')
+
+        # 提取来源字段
+        field_match = re.search(r'\.`?([a-zA-Z0-9_]+)`?', raw_expr)
+        source_expr = field_match.group(1) if field_match else raw_expr
+
+        if not source_table and source_full_names:
+            source_table = source_full_names[0]
+
+        mappings.append({
+            'targetField': target_field,
+            'sourceTable': source_table,
+            'sourceExpr': source_expr,
+            'transform': transform,
+        })
+
+    return mappings

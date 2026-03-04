@@ -152,6 +152,7 @@ async def tool_calling_loop_node(state: dict) -> dict:
 
     render_blocks = {}
     block_counter = [1]  # 可变计数器
+    write_ops: list[dict] = []  # 记录成功的写操作（INSERT）
 
     # ── 构建 system prompt ──
     selected_tables_note = ""
@@ -283,6 +284,7 @@ execute_sql 工具返回的结果中会包含「数据块 ID」（如 TABLE_1、
                 return _process_final_response(
                     result.get("content", ""),
                     render_blocks, current_step_hint, connection_test_ok,
+                    write_ops,
                 )
 
             # 处理 tool calls
@@ -306,7 +308,7 @@ execute_sql 工具返回的结果中会包含「数据块 ID」（如 TABLE_1、
             async def _run_tool(tc):
                 logger.info("[Tool] call: %s args=%s", tc.function.name, tc.function.arguments[:200])
                 res = await execute_tool_call(
-                    tc, connection_string, render_blocks, block_counter,
+                    tc, connection_string, render_blocks, block_counter, write_ops,
                 )
                 logger.info("[Tool] result: %s", res[:200])
                 return tc.id, res
@@ -327,6 +329,7 @@ execute_sql 工具返回的结果中会包含「数据块 ID」（如 TABLE_1、
         content = result.get("content", "") if result.get("ok") else "对话处理超时，请重试。"
         return _process_final_response(
             content, render_blocks, current_step_hint, connection_test_ok,
+            write_ops,
         )
 
     except Exception as e:
@@ -339,7 +342,7 @@ execute_sql 工具返回的结果中会包含「数据块 ID」（如 TABLE_1、
         }
 
 
-def _process_final_response(content, render_blocks, current_step_hint, connection_test_ok):
+def _process_final_response(content, render_blocks, current_step_hint, connection_test_ok, write_ops=None):
     """处理 LLM 最终文本回复：解析 JSON、替换 {{BLOCK_ID}} 占位符。"""
     content = (content or "").strip()
     json_match = re.search(r"\{[\s\S]*\}", content)
@@ -374,7 +377,7 @@ def _process_final_response(content, render_blocks, current_step_hint, connectio
                 out["currentStep"], len(out["reply"]),
                 list(render_blocks.keys()) if render_blocks else [])
 
-    return {
+    response = {
         "llm_response": {
             "reply": out["reply"],
             "connectionReceived": out["connectionReceived"],
@@ -382,6 +385,20 @@ def _process_final_response(content, render_blocks, current_step_hint, connectio
             "currentStep": out["currentStep"],
         }
     }
+
+    # 如果有成功的 INSERT 操作，返回结构化的加工表信息
+    if write_ops:
+        # 取最后一个 INSERT 操作（通常一轮只有一个）
+        last_op = write_ops[-1]
+        response["llm_response"]["processedTable"] = {
+            "database": last_op["database"],
+            "table": last_op["table"],
+            "insertSql": last_op["insertSql"],
+            "sourceTables": last_op["sourceTables"],
+            "fieldMappings": last_op.get("fieldMappings", []),
+        }
+
+    return response
 
 
 # ---------------------------------------------------------------------------
