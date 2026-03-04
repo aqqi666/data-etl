@@ -1,9 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { Database, RotateCcw, PanelRightClose } from 'lucide-react';
-import { useStore } from '../store';
-import { useMetricChatStore } from '../metricChatStore';
+import { useUnifiedChatStore } from '../unifiedChatStore';
 import { useDashboardStore } from '../dashboardStore';
-import { useChatModeStore } from '../chatModeStore';
 import { useSchemaStore } from '../schemaStore';
 import ChatMessage from './ChatMessage';
 import ChatInput from './ChatInput';
@@ -27,42 +25,21 @@ function TypingIndicator() {
 }
 
 export default function AgentPanel({ onCollapse }: { onCollapse: () => void }) {
-  const mode = useChatModeStore(s => s.mode);
-
-  // ETL store
-  const etlMessages = useStore(s => s.messages);
-  const etlProcessing = useStore(s => s.isProcessing);
-  const etlReset = useStore(s => s.reset);
-  const loadForDashboard = useStore(s => s.loadForDashboard);
-
-  // Metric chat store
-  const metricMessages = useMetricChatStore(s => s.messages);
-  const metricProcessing = useMetricChatStore(s => s.isProcessing);
-  const metricReset = useMetricChatStore(s => s.reset);
-  const setMetricConn = useMetricChatStore(s => s.setConnectionString);
-  const loadMetricForDashboard = useMetricChatStore(s => s.loadForDashboard);
+  const messages = useUnifiedChatStore(s => s.messages);
+  const isProcessing = useUnifiedChatStore(s => s.isProcessing);
+  const handleReset = useUnifiedChatStore(s => s.reset);
+  const loadForDashboard = useUnifiedChatStore(s => s.loadForDashboard);
   const loadSchemaForDashboard = useSchemaStore(s => s.loadForDashboard);
-
-  // Sync connection string from ETL store to metric chat store
-  const etlConn = useStore(s => s.connectionString);
-  useEffect(() => {
-    if (etlConn) setMetricConn(etlConn);
-  }, [etlConn, setMetricConn]);
 
   const activeDashboardId = useDashboardStore(s => s.activeDashboardId);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
-  const messages = mode === 'etl' ? etlMessages : metricMessages;
-  const isProcessing = mode === 'etl' ? etlProcessing : metricProcessing;
-  const handleReset = mode === 'etl' ? etlReset : metricReset;
-
   useEffect(() => {
     if (activeDashboardId) {
       loadForDashboard(activeDashboardId);
-      loadMetricForDashboard(activeDashboardId);
       loadSchemaForDashboard(activeDashboardId);
     }
-  }, [activeDashboardId, loadForDashboard, loadMetricForDashboard, loadSchemaForDashboard]);
+  }, [activeDashboardId, loadForDashboard, loadSchemaForDashboard]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });

@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from config import LLM_API_KEY
-from graphs.etl_chat_graph import build_etl_chat_graph
+from graphs.unified_chat_graph import build_unified_chat_graph
 
 logger = logging.getLogger("etl.router")
 router = APIRouter()
@@ -22,14 +22,22 @@ async def chat(request_body: dict):
         return JSONResponse(status_code=400, content={"error": "Missing or invalid conversation"})
 
     try:
-        graph = build_etl_chat_graph()
+        graph = build_unified_chat_graph()
         initial_state = {
             'conversation': conversation,
             'context': context,
             'connection_string': None,
             'should_test_connection': False,
+            'conn_str_to_test': None,
             'connection_test_note': '',
             'connection_test_ok': False,
+            'last_user_content': '',
+            'last_message_is_only_connection_string': False,
+            'current_step_hint': 0,
+            'selected_tables': [],
+            'schema_context': '',
+            'processed_tables_summary': '',
+            'metric_defs_summary': '',
             'render_blocks': {},
             'llm_response': {},
         }

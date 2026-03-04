@@ -47,6 +47,8 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     saveDashboards(updated);
     // 清理该 dashboard 的聊天记录
     localStorage.removeItem(`etl-chat-${id}`);
+    localStorage.removeItem(`etl-unified-chat-${id}`);
+    localStorage.removeItem(`etl-metric-chat-${id}`);
     // 清理该 dashboard 的已加工表记录
     useProcessedTableStore.getState().clearByDashboard(id);
     set({ dashboards: updated });

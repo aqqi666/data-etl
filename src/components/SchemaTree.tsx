@@ -1,10 +1,10 @@
 import { useEffect, useState, useMemo } from 'react';
 import { Database, Table2, ChevronRight, ChevronDown, Loader2, RefreshCw } from 'lucide-react';
 import { useSchemaStore } from '../schemaStore';
-import { useStore } from '../store';
+import { useUnifiedChatStore } from '../unifiedChatStore';
 
 export default function SchemaTree() {
-  const connectionString = useStore(s => s.connectionString);
+  const connectionString = useUnifiedChatStore(s => s.connectionString);
   const { tree, loading, error, selectedTables, expandedDbs, fetchTree, toggleTable, toggleAllDbTables, expandDb, collapseDb } = useSchemaStore();
   const [panelOpen, setPanelOpen] = useState(false);
 

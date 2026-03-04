@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { X, Loader2, AlertCircle, BarChart3, Database, Code2, GitBranch, Copy, Check } from 'lucide-react';
 import type { MetricDef } from '../types';
-import { useStore } from '../store';
+import { useUnifiedChatStore } from '../unifiedChatStore';
 import { useMetricStore } from '../metricStore';
 import { useProcessedTableStore } from '../processedTableStore';
 import { fetchMetricLineage } from '../api';
@@ -315,7 +315,7 @@ const TABS: { key: Tab; label: string; icon: typeof BarChart3 }[] = [
 ];
 
 export default function MetricDefDetailModal({ def, onClose }: { def: MetricDef; onClose: () => void }) {
-  const connectionString = useStore(s => s.connectionString);
+  const connectionString = useUnifiedChatStore(s => s.connectionString);
   const allProcessedTables = useProcessedTableStore(s => s.tables);
   const allMetrics = useMetricStore(s => s.metrics);
   const [tab, setTab] = useState<Tab>('info');

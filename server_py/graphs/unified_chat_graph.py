@@ -1,0 +1,543 @@
+"""Unified conversation LangGraph state graph — single prompt covering ETL + metric."""
+
+import asyncio
+import json
+import logging
+import re
+from typing import TypedDict, Optional
+
+from langgraph.graph import StateGraph, END
+
+logger = logging.getLogger("etl.unified_graph")
+
+from db.connection import looks_like_connection_string, test_connection
+from db.operations import run_database_operation
+from llm.client import call_llm
+from llm.tools import SQL_TOOLS, execute_tool_call
+
+
+# ---------------------------------------------------------------------------
+# State type
+# ---------------------------------------------------------------------------
+
+class UnifiedChatState(TypedDict):
+    conversation: list
+    context: dict
+    connection_string: Optional[str]
+    should_test_connection: bool
+    conn_str_to_test: Optional[str]
+    connection_test_note: str
+    connection_test_ok: bool
+    last_user_content: str
+    last_message_is_only_connection_string: bool
+    current_step_hint: int
+    selected_tables: list
+    schema_context: str
+    processed_tables_summary: str
+    metric_defs_summary: str
+    render_blocks: dict
+    llm_response: dict
+
+
+# ---------------------------------------------------------------------------
+# Node 1: parse_input
+# ---------------------------------------------------------------------------
+
+async def parse_input(state: dict) -> dict:
+    conversation = state.get("conversation", [])
+    context = state.get("context", {}) or {}
+
+    connection_string_from_context = context.get("connectionString") or None
+    current_step_hint = int(context.get("currentStep", 0) or 0)
+    selected_tables = context.get("selectedTables", [])
+    if not isinstance(selected_tables, list):
+        selected_tables = []
+
+    processed_tables_summary = context.get("processedTablesSummary", "") or ""
+    metric_defs_summary = context.get("metricDefsSummary", "") or ""
+
+    user_messages = [
+        (t.get("content") or "").strip()
+        for t in conversation
+        if t.get("role") == "user"
+    ]
+    last_user_content = user_messages[-1] if user_messages else ""
+
+    last_connection_string_in_chat = None
+    for msg in reversed(user_messages):
+        if looks_like_connection_string(msg):
+            last_connection_string_in_chat = msg
+            break
+
+    connection_string = (
+        connection_string_from_context
+        or last_connection_string_in_chat
+        or None
+    )
+
+    should_test_connection = bool(
+        (last_user_content and looks_like_connection_string(last_user_content))
+        or (
+            last_user_content
+            and re.search(r"测试|试一下|验证|检查", last_user_content)
+            and re.search(r"连接|连接串|连通", last_user_content)
+            and last_connection_string_in_chat
+        )
+    )
+
+    if looks_like_connection_string(last_user_content):
+        conn_str_to_test = last_user_content
+    else:
+        conn_str_to_test = last_connection_string_in_chat
+
+    last_message_is_only_connection_string = bool(
+        last_user_content
+        and looks_like_connection_string(last_user_content)
+        and len(last_user_content.strip()) < 500
+    )
+
+    return {
+        "connection_string": connection_string,
+        "should_test_connection": should_test_connection,
+        "conn_str_to_test": conn_str_to_test,
+        "connection_test_note": "",
+        "connection_test_ok": False,
+        "last_user_content": last_user_content,
+        "last_message_is_only_connection_string": last_message_is_only_connection_string,
+        "current_step_hint": current_step_hint,
+        "selected_tables": selected_tables,
+        "processed_tables_summary": processed_tables_summary,
+        "metric_defs_summary": metric_defs_summary,
+        "schema_context": "",
+        "render_blocks": {},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node 2: test_connection_node
+# ---------------------------------------------------------------------------
+
+async def test_connection_node(state: dict) -> dict:
+    should_test = state.get("should_test_connection", False)
+    conn_str_to_test = state.get("conn_str_to_test")
+
+    if not should_test or not conn_str_to_test:
+        return {"connection_test_note": "", "connection_test_ok": False}
+
+    try:
+        test_result = await test_connection(conn_str_to_test)
+        connection_test_ok = bool(test_result.get("ok"))
+        if test_result.get("ok"):
+            connection_test_note = "\n\n**【连接测试结果】** 连通性测试：**成功**。"
+        else:
+            connection_test_note = (
+                f'\n\n**【连接测试结果】** 连通性测试：**失败**，原因：{test_result.get("message")}'
+            )
+    except Exception as e:
+        connection_test_ok = False
+        connection_test_note = f"\n\n**【连接测试结果】** 异常：{e}"
+
+    return {
+        "connection_test_note": connection_test_note,
+        "connection_test_ok": connection_test_ok,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node 3: fetch_schema_context (always runs)
+# ---------------------------------------------------------------------------
+
+async def fetch_schema_context_node(state: dict) -> dict:
+    """Fetch table schema context for selected tables."""
+    connection_string = state.get("connection_string")
+    selected = state.get("selected_tables", [])
+    schema_context = ""
+
+    if not connection_string:
+        return {"schema_context": schema_context}
+
+    if len(selected) > 0:
+        schema_lines = []
+        for tbl in selected:
+            parts = tbl.split(".")
+            if len(parts) == 2:
+                desc_result = await run_database_operation(
+                    connection_string, "describeTable",
+                    {"database": parts[0], "table": parts[1]},
+                )
+                if desc_result["ok"] and desc_result.get("data", {}).get("columns"):
+                    cols = "\n".join(
+                        f'    {c["Field"]} {c["Type"]}'
+                        f'{" -- " + c["Comment"] if c.get("Comment") else ""}'
+                        for c in desc_result["data"]["columns"]
+                    )
+                    schema_lines.append(f"  {tbl}:\n{cols}")
+        if schema_lines:
+            schema_context = (
+                f'\n\n**可用表结构（仅限用户选中的 {len(selected)} 张表，严禁使用其他表）**：\n'
+                f'{chr(10).join(schema_lines)}'
+            )
+
+    return {"schema_context": schema_context}
+
+
+# ---------------------------------------------------------------------------
+# System prompt builder — single unified prompt
+# ---------------------------------------------------------------------------
+
+def _build_system_prompt(
+    selected_tables, current_step_hint, connection_test_note,
+    schema_context, processed_tables_summary, metric_defs_summary,
+):
+    selected_tables_note = ""
+    if len(selected_tables) > 0:
+        selected_tables_note = (
+            f'\n**【用户已选中的库表（必须严格遵守）】**：{", ".join(selected_tables)}\n'
+            "用户在界面上勾选了以上库表，你**只能**使用这些库表进行操作和讨论。"
+            "不要提及或建议用户使用未选中的库表。"
+            "当用户说「看看有哪些表」「有哪些库」时，只展示选中范围内的库表。\n"
+        )
+
+    # ── 跨上下文注入 ──
+    processed_tables_note = ""
+    if processed_tables_summary:
+        processed_tables_note = f"""
+**【已有的加工表（优先使用）】**：{processed_tables_summary}
+注意：定义指标时优先考虑使用已加工的业务表，它们的数据更加规范。
+如果需要的数据还没有对应的加工表，可以建议用户先加工一张业务表。
+"""
+
+    metric_defs_note = ""
+    if metric_defs_summary:
+        metric_defs_note = f"""
+**【已定义的指标（参考信息）】**：
+{metric_defs_summary}
+注意：
+- 如果当前操作可能影响已有指标（如修改字段、删除表），请主动提醒用户。
+- 如果发现加工表缺少某指标需要的字段，可以主动建议补充。
+- 用户想定义新指标时，先检查是否可以基于已有指标组合出复合指标。
+"""
+
+    # ── 以旧 ETL prompt 为基底，追加指标能力 ──
+    return f"""你是智能数据助手，帮助用户通过对话完成数据加工（ETL）和指标定义。
+{selected_tables_note}
+**你有一个工具 `execute_sql`**，可以在用户的 MySQL 数据库上执行任意 SQL。需要查数据、建库、建表、写入数据时，直接调用工具执行 SQL 即可。你可以多次调用工具来完成多步操作（如先建库再建表）。**当有多条互相独立的 SQL 需要执行时（如同时查看多张表的结构、同时预览多张表的数据），你应该在同一轮回复中同时调用多次工具，系统会并行执行，大幅提升效率。**
+
+**步骤自动判断**：ETL 流程有 6 步：1-连接数据库、2-选择基表、3-定义目标表、4-字段映射、5-数据验证、6-异常溯源。
+你需要根据**对话上下文**自动判断当前处于哪一步（currentStep 字段，1～6），并在回复中自然引导用户完成当前步、过渡到下一步。
+
+**重要：界面没有「下一步」按钮**。用户只能根据你在对话里的提示进行下一步操作，因此你**必须在回复中根据当前进度明确、自然地提示用户下一步可以做什么**（例如：连接成功后提示输入要加工的库/表、建表成功后提示描述字段映射、映射执行后提示可验证数据等）。**不要写死固定话术**，根据你对对话的理解灵活提醒，让用户知道「现在可以输入什么、做什么」即可。
+
+判断规则：
+- 尚未发送过连接串或连接未成功 → 1
+- 连接成功但尚未选定基表 → 2
+- 已选定基表、用户在讨论目标表字段或生成 CREATE TABLE → 3
+- 目标表已建好、用户在讨论映射或生成 INSERT INTO ... SELECT → 4
+- 映射已执行、用户在讨论验证/空值/数据质量 → 5
+- 用户提到追溯/去源表看/检查基表 → 6
+- 若无法判断则保持上一轮 currentStep（前端上一轮传入的 currentStep 为 {current_step_hint}，若为 0 则默认 1）。
+当用户完成一步后，在回复末尾**自然提示下一步可做的操作**，但不要跳步。
+
+**硬性约定（必须遵守）**：
+- **一切会修改库表或数据的操作（DDL 与 DML）都必须先展示完整 SQL 并获用户明确确认后才能调用工具执行。** 包括：CREATE TABLE、CREATE DATABASE、INSERT INTO ... SELECT 等。你先展示 SQL 并提示「请确认后说「确认」或「执行」」，只有用户明确回复「确认」「执行」「可以」后才调用 execute_sql 工具真实执行。只读操作（如 SELECT、DESCRIBE、SHOW）可直接调用工具执行，无需确认。
+- 所有 SQL、DDL、DML 必须**严格符合 MySQL 语法**（仅使用 MySQL 支持的类型、函数、写法）。
+- 所有库/表操作均在**用户提供的连接上真实执行**，由后端连接用户库执行，不模拟、不造假。
+
+**【数据块引用机制】**：
+execute_sql 工具返回的结果中会包含「数据块 ID」（如 TABLE_1、SQL_1），这些 ID 对应真实的查询结果数据。
+你在最终回复中**必须使用 `{{{{BLOCK_ID}}}}` 占位符**来引用这些数据，**严禁**自己手写或复制表格/SQL内容。
+示例：工具返回 "查询成功，返回 10 行。数据块: SQL_1（SQL）, TABLE_1（结果表格，10行）"
+你的回复应为："表结构如下：\n\n{{{{SQL_1}}}}\n\n{{{{TABLE_1}}}}\n\n执行成功，共返回 10 行数据。"
+后端会自动将 `{{{{BLOCK_ID}}}}` 替换为真实内容。这样做的好处是：数据 100% 准确，不会出错。
+**注意**：
+- 只引用工具返回中列出的数据块 ID，不要编造不存在的 ID
+- 你只需要写自然语言 + {{{{BLOCK_ID}}}} 占位符，不要自己写表格或 SQL 代码块
+
+- **凡涉及表数据验证、数据展示的回答**（如：表结构、前 N 条数据、空值分析、库表列表、任意 SELECT 结果），回复中**禁止出现 JSON**，必须严格按以下顺序且用**表格**展示数据：(1) **验证/执行的 SQL**（用 {{{{SQL_N}}}} 引用）；(2) **实际返回的表格**（用 {{{{TABLE_N}}}} 引用）；(3) **SQL 返回码**（如：执行成功，返回行数/列数/影响行数）。**表格内容必须严格根据工具返回的执行结果**：逐行逐列照实填写，不得自行编造、补全、推测或改写任何单元格。
+- **SQL 执行失败时**：若工具返回了失败信息，你必须 (1) **如实、完整**地把失败原因输出给用户（不得隐瞒、不得改写为"成功"）；(2) **禁止**以任何方式声称"执行成功""已完成""已创建"等；(3) **自我纠正**：若失败原因为「列不存在」「Unknown column」等，你须先调用工具查询涉及表的真实结构（DESCRIBE），然后根据真实列名给出**修正后的完整可执行 SQL**，并明确提示用户「请再次执行上述 SQL」。
+- 只有工具明确返回成功时，才可在回复中说"成功"；否则一律按失败处理并输出真实原因。
+{connection_test_note}
+{schema_context}
+{processed_tables_note}
+{metric_defs_note}
+
+**各步骤引导说明**：
+
+**第1步：连接数据库**
+- 用户提供 MySQL 连接串（URL 如 mysql://user:pass@host:port/db 或命令行形式）。
+- 若有【连接测试结果】且成功 → 回复「连接成功。」并**自然引导**进入第 2 步（如：「接下来请告诉我你想基于哪个库的哪张表做数据加工？」）。
+- 若测连失败 → 如实说明错误信息，提示用户检查连接串或权限。
+- 若本轮用户发送了连接串，必须设置 "connectionReceived": true。
+
+**第2步：选择基表**
+- 围绕「有哪些库」「某个库下有哪些表」「我要用哪张表」这类问题回答。
+- 用户想看库/表/表结构时，直接调用 execute_sql 工具执行对应 SQL（SHOW DATABASES、SHOW TABLES、DESCRIBE 等），然后用 {{{{BLOCK_ID}}}} 引用结果。
+- 若用户说「基于 xxx 表做加工」「用 xxx 表」，调用工具执行 DESCRIBE 和 SELECT * LIMIT 10，以**表格**形式展示表结构和前 10 条数据（禁止用 JSON）；分析只基于真实数据，不得编造。
+- **只要本轮展示了某张基表的结构/数据，回复末尾必须明确引导下一步**，例如：「基表已确认。接下来请描述目标表要有哪些字段（字段名、类型、含义），或说明要放在哪个库，我来生成建表语句。」不得只展示表结构而不提示用户下一步该干啥。
+
+**第3步：定义目标表**
+- 用户描述目标表字段后 → 你根据描述生成 **标准 MySQL** 的 CREATE TABLE 语句（仅用 MySQL 支持的类型，字段带 COMMENT，库名/表名可用反引号），**仅展示给用户，并明确提示「请确认后再执行」或「确认后请回复「确认」或「执行」」**；不得在用户未确认时调用工具执行建表。
+- 只有用户明确回复「确认建表」「确认」「执行」「可以」等后，才调用 execute_sql 工具真实执行建表（如果 DDL 中有 database.table 格式，先建库再建表），你如实反馈结果。
+- 建表成功后，自然引导进入第 4 步（如：「目标表已创建，请描述每个字段的数据来源与加工逻辑。」）。
+
+**第4步：字段映射**
+- 围绕「目标字段如何从基表/维表中取数、怎么加工」来对话。
+- **维表/基表字段必须用真实列名**：写 JOIN、SELECT 时只能使用**已查询过的表结构**中的列名；若某维表尚未查过结构，**不得臆造列名**，应先调用工具查看表结构（DESCRIBE），再根据真实列名写 DML。
+- 用户描述字段映射后 → 你生成 **标准 MySQL** 的 INSERT INTO 目标表 SELECT ... FROM 基表 的 DML（JOIN 写法，禁止子查询），**仅展示完整 SQL，并明确提示「请确认后说「确认」或「执行」」**；不得在用户未确认时调用工具执行。只有用户明确回复「确认」「执行」后，才调用 execute_sql 工具执行该 DML。
+- 执行后必须写出 SQL + SQL 返回码（影响行数等）。若执行失败，须先调用工具查询涉及表的真实结构，然后**直接给出修正后的完整 SQL** 并提示再次执行，直至成功。
+- 映射执行成功后，自然引导进入第 5 步（如：「数据已写入目标表，可以发送"开始验证"检查数据质量。」）。
+
+**第5步：数据验证**
+- 围绕「目标表数据是否正常」「哪些字段空值多」「是否有异常值」来回答。
+- 调用工具执行验证 SQL（如空值分析、数据预览等），以**表格**形式展示实际返回，**禁止**用 JSON。用 {{{{BLOCK_ID}}}} 引用工具返回的数据块。
+- 若发现异常，自然引导进入第 6 步（如：「发现 xxx 字段空值较多，可以说"追溯 xxx 字段"去源表排查原因。」）。
+
+**第6步：异常溯源**
+- 用户提到「去源表看看」「追溯某字段」「检查基表数据」时，调用工具查询并展示基表真实数据。
+- 回复中必须写出**验证 SQL**并以**表格**展示实际查询结果，禁止 JSON、不得编造；对比目标表和基表的数据情况分析原因。
+
+**指标定义能力**：
+除了 ETL 加工，你还能帮用户定义度量指标（如收入、订单量、活跃用户数）：
+- 指标 = 一个度量（不含维度），维度在后续"添加监控数据"时由用户指定
+- 指标定义需要明确：指标名称、计算逻辑描述、聚合方式、度量字段、涉及的表
+- **指标定义流程**：用户描述想要的指标 → 先检查能否基于已有指标组合出复合指标 → 查看已加工的业务表是否满足需求（优先使用） → 若不满足，查看基表/维表，建议加工成新的业务表或在已有业务表加字段 → 也可以直接使用基表 → 用户确认后生成指标定义
+- 如何判断用户意图：「定义指标」「我想看收入」「统计订单量」「添加指标」等 → 指标定义能力；两种能力可以混合使用，定义指标时发现需要加工表，直接引导加工即可
+
+**通用回复规则**：
+1. 用中文回复，简洁友好。**因无「下一步」按钮，你必须在对话中提示用户下一步该干啥**：根据当前步骤和对话理解，在回复中自然说明「接下来可以输入/做什么」（不写死话术，灵活提醒）。
+2. **你执行的每一个 SQL 都必须在回复中给出返回结果**：SELECT 须有表格 + 返回行数；INSERT 等须明确写出**SQL 返回码**。**禁止**只写「正在执行」而不写执行结果。用 {{{{BLOCK_ID}}}} 引用工具返回的数据块。
+3. 若工具执行失败，必须**如实输出失败原因**，并给出**自我纠正**建议。
+4. 若本轮**没有调用过工具**，**不得声称**已执行任何数据库操作。
+5. 若用户发送了 MySQL 连接串，设置 "connectionReceived": true。
+6. **所有会修改库表或数据的操作（DDL、DML）**：建库、建表、INSERT INTO ... SELECT 等，都必须**先展示 SQL 并提示用户确认**，只有用户明确回复「确认」「执行」「可以」后才调用工具真实执行。不得在用户未确认时执行任何写操作。
+
+**输出格式**：只返回一个 JSON 对象，不要 markdown 代码块：
+{{"reply":"你的回复内容（可含 markdown 格式化，有数据块时用 {{{{BLOCK_ID}}}} 引用）","connectionReceived":false,"currentStep":1}}
+
+当用户确认指标定义后（明确说确认/可以/没问题），额外返回 metricDef 字段：
+{{"reply":"指标已创建：xxx","connectionReceived":false,"currentStep":1,"metricDef":{{"name":"指标名称","definition":"指标计算逻辑描述","tables":["db.table1"],"aggregation":"SUM","measureField":"amount"}}}}
+
+**aggregation 可选值**：SUM、COUNT、AVG、COUNT_DISTINCT、MAX、MIN
+**重要**：只有用户明确确认后才返回 metricDef。讨论阶段不要返回 metricDef。
+
+**重要**：
+- currentStep 必须填入你判断的当前步骤（1～6 的整数），前端会根据它更新进度条。
+- reply 里涉及表数据时，必须是「SQL 代码块 + markdown 表格 + 返回码」三部分，禁止 JSON。**有数据块时用 {{{{BLOCK_ID}}}} 引用，表格内容必须与工具返回结果完全一致，不得编造。**"""
+
+
+# ---------------------------------------------------------------------------
+# Node 4: tool_calling_loop_node
+# ---------------------------------------------------------------------------
+
+async def tool_calling_loop_node(state: dict) -> dict:
+    conversation = state.get("conversation", [])
+    connection_string = state.get("connection_string")
+    connection_test_note = state.get("connection_test_note", "")
+    connection_test_ok = state.get("connection_test_ok", False)
+    selected_tables = state.get("selected_tables", [])
+    current_step_hint = state.get("current_step_hint", 0)
+    schema_context = state.get("schema_context", "")
+    processed_tables_summary = state.get("processed_tables_summary", "")
+    metric_defs_summary = state.get("metric_defs_summary", "")
+
+    render_blocks = {}
+    block_counter = [1]
+    write_ops: list[dict] = []
+
+    system_prompt = _build_system_prompt(
+        selected_tables, current_step_hint, connection_test_note,
+        schema_context, processed_tables_summary, metric_defs_summary,
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        *[{"role": t["role"], "content": t["content"]} for t in conversation],
+    ]
+
+    tools = SQL_TOOLS if connection_string else None
+
+    MAX_TOOL_ROUNDS = 5
+    try:
+        for round_i in range(MAX_TOOL_ROUNDS):
+            result = await call_llm(
+                messages, tools=tools,
+                temperature=0.3, max_tokens=4096,
+                caller=f"unified_r{round_i}",
+            )
+
+            if not result.get("ok"):
+                return {
+                    "llm_response": {
+                        "_error": result.get("error") or "LLM 请求失败",
+                        "_status": result.get("status", 500),
+                    }
+                }
+
+            tool_calls = result.get("tool_calls")
+
+            if not tool_calls:
+                return _process_final_response(
+                    result.get("content", ""),
+                    render_blocks, current_step_hint, connection_test_ok,
+                    write_ops,
+                )
+
+            messages.append({
+                "role": "assistant",
+                "content": result.get("content"),
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
+
+            async def _run_tool(tc):
+                logger.info("[Tool] call: %s args=%s", tc.function.name, tc.function.arguments[:200])
+                res = await execute_tool_call(
+                    tc, connection_string, render_blocks, block_counter, write_ops,
+                )
+                logger.info("[Tool] result: %s", res[:200])
+                return tc.id, res
+
+            results = await asyncio.gather(*[_run_tool(tc) for tc in tool_calls])
+            for tc_id, tool_result in results:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": tool_result,
+                })
+
+        result = await call_llm(
+            messages, temperature=0.3, max_tokens=4096,
+            caller="unified_final",
+        )
+        content = result.get("content", "") if result.get("ok") else "对话处理超时，请重试。"
+        return _process_final_response(
+            content, render_blocks, current_step_hint, connection_test_ok,
+            write_ops,
+        )
+
+    except Exception as e:
+        logger.error("[Unified] tool_calling_loop error: %s", e)
+        return {
+            "llm_response": {
+                "_error": str(e) or "LLM 请求失败",
+                "_status": 500,
+            }
+        }
+
+
+# ---------------------------------------------------------------------------
+# Response processing — handles both ETL and metric fields
+# ---------------------------------------------------------------------------
+
+def _process_final_response(content, render_blocks, current_step_hint, connection_test_ok, write_ops=None):
+    content = (content or "").strip()
+    json_match = re.search(r"\{[\s\S]*\}", content)
+
+    out = {
+        "reply": content,
+        "connectionReceived": False,
+        "currentStep": current_step_hint or 1,
+    }
+
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group(0))
+            if isinstance(parsed.get("reply"), str):
+                out["reply"] = parsed["reply"]
+            if parsed.get("connectionReceived"):
+                out["connectionReceived"] = True
+            cs = parsed.get("currentStep")
+            if isinstance(cs, (int, float)) and 1 <= cs <= 6:
+                out["currentStep"] = int(cs)
+            if parsed.get("metricDef"):
+                out["metricDef"] = parsed["metricDef"]
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Replace {{BLOCK_ID}} placeholders
+    if render_blocks:
+        reply = out["reply"]
+        for bid, content_val in render_blocks.items():
+            reply = reply.replace("{{" + bid + "}}", content_val)
+            reply = reply.replace("{" + bid + "}", content_val)
+        out["reply"] = reply
+
+    logger.info("[Unified] step=%d reply_len=%d has_metricDef=%s blocks=%s",
+                out["currentStep"], len(out["reply"]),
+                "metricDef" in out,
+                list(render_blocks.keys()) if render_blocks else [])
+
+    response = {
+        "llm_response": {
+            "reply": out["reply"],
+            "connectionReceived": out["connectionReceived"],
+            "connectionTestOk": connection_test_ok,
+            "currentStep": out["currentStep"],
+        }
+    }
+
+    if out.get("metricDef"):
+        response["llm_response"]["metricDef"] = out["metricDef"]
+
+    if write_ops:
+        last_op = write_ops[-1]
+        response["llm_response"]["processedTable"] = {
+            "database": last_op["database"],
+            "table": last_op["table"],
+            "insertSql": last_op["insertSql"],
+            "sourceTables": last_op["sourceTables"],
+            "fieldMappings": last_op.get("fieldMappings", []),
+        }
+
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+
+def should_test_connection_router(state: dict) -> str:
+    if state.get("should_test_connection"):
+        logger.info("[Router] parse_input → test_connection")
+        return "test_connection"
+    logger.info("[Router] parse_input → fetch_schema_context")
+    return "fetch_schema_context"
+
+
+# ---------------------------------------------------------------------------
+# Graph construction
+# ---------------------------------------------------------------------------
+
+def build_unified_chat_graph():
+    graph = StateGraph(UnifiedChatState)
+
+    graph.add_node("parse_input", parse_input)
+    graph.add_node("test_connection", test_connection_node)
+    graph.add_node("fetch_schema_context", fetch_schema_context_node)
+    graph.add_node("tool_calling_loop", tool_calling_loop_node)
+
+    graph.set_entry_point("parse_input")
+
+    graph.add_conditional_edges(
+        "parse_input",
+        should_test_connection_router,
+        {
+            "test_connection": "test_connection",
+            "fetch_schema_context": "fetch_schema_context",
+        },
+    )
+
+    graph.add_edge("test_connection", "fetch_schema_context")
+    graph.add_edge("fetch_schema_context", "tool_calling_loop")
+    graph.add_edge("tool_calling_loop", END)
+
+    return graph.compile()

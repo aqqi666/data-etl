@@ -1,11 +1,14 @@
 export type ContentBlock =
   | { type: 'text'; text: string };
 
+export type ChatMode = 'etl' | 'metric';
+
 export interface ChatMessage {
   id: string;
   role: 'system' | 'user';
   contents: ContentBlock[];
   timestamp: number;
+  mode?: ChatMode;
 }
 
 /** ETL 向导步骤 1～6 */

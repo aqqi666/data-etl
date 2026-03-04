@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { X, Database, Loader2, AlertCircle } from 'lucide-react';
 import type { ProcessedTable } from '../types';
-import { useStore } from '../store';
+import { useUnifiedChatStore } from '../unifiedChatStore';
 import { fetchLineage } from '../api';
 import type { LineageResponse } from '../api';
 
@@ -205,7 +205,7 @@ function LineageDiagram({ data }: { data: LineageResponse }) {
 }
 
 export default function LineageModal({ table, onClose, onAddMetric }: Props) {
-  const connectionString = useStore(s => s.connectionString);
+  const connectionString = useUnifiedChatStore(s => s.connectionString);
   const [lineage, setLineage] = useState<LineageResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');

@@ -16,6 +16,12 @@ export interface ChatContext {
   currentStep?: number;
   /** 用户选中的库表列表（格式 db.table） */
   selectedTables?: string[];
+  /** 当前模式：etl | metric */
+  mode?: string;
+  /** 已有加工表摘要（跨上下文注入） */
+  processedTablesSummary?: string;
+  /** 已有指标定义摘要（跨上下文注入） */
+  metricDefsSummary?: string;
 }
 
 import type { ChartType } from './types';
@@ -43,6 +49,14 @@ export interface ChatApiResponse {
     insertSql: string;
     sourceTables: string[];
     fieldMappings: { targetField: string; sourceTable: string; sourceExpr: string; transform: string }[];
+  };
+  /** 后端在指标确认时返回的指标定义 */
+  metricDef?: {
+    name: string;
+    definition: string;
+    tables: string[];
+    aggregation: string;
+    measureField: string;
   };
 }
 

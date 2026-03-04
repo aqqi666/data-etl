@@ -3,7 +3,7 @@ import { LayoutDashboard, Plus, Table2, Clock } from 'lucide-react';
 import { useDashboardStore } from '../dashboardStore';
 import { useMetricStore } from '../metricStore';
 import { useProcessedTableStore } from '../processedTableStore';
-import { useStore } from '../store';
+import { useUnifiedChatStore } from '../unifiedChatStore';
 import MetricCard, { isCompactMetric } from './MetricCard';
 import AddMetricModal from './AddMetricModal';
 import LineageModal from './LineageModal';
@@ -18,7 +18,7 @@ export default function DashboardContent() {
   const deleteMetric = useMetricStore(s => s.deleteMetric);
   const refreshMetric = useMetricStore(s => s.refreshMetric);
   const reorderMetrics = useMetricStore(s => s.reorderMetrics);
-  const connectionString = useStore(s => s.connectionString);
+  const connectionString = useUnifiedChatStore(s => s.connectionString);
 
   const allProcessedTables = useProcessedTableStore(s => s.tables);
   const processedTables = allProcessedTables.filter(t => t.dashboardId === activeDashboardId);

@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Loader2, Sparkles, Check, X, BarChart3, ChevronDown, Search } from 'lucide-react';
 import { useMetricStore } from '../metricStore';
 import { useMetricDefStore } from '../metricDefStore';
-import { useStore } from '../store';
+import { useUnifiedChatStore } from '../unifiedChatStore';
 import { fetchMetricMatch } from '../api';
 import type { ChartType, MetricDef } from '../types';
 
@@ -28,7 +28,7 @@ interface MatchResult {
 }
 
 export default function AddMetricModal({ dashboardId, onClose }: Props) {
-  const connectionString = useStore(s => s.connectionString);
+  const connectionString = useUnifiedChatStore(s => s.connectionString);
   const { generating, generateMetric, confirmMetric } = useMetricStore();
   const allDefs = useMetricDefStore(s => s.defs);
   const metricDefs = allDefs.filter(d => d.dashboardId === dashboardId);
