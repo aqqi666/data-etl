@@ -92,38 +92,41 @@ async def execute_tool_call(
         cur = await conn.cursor(aiomysql.DictCursor)
         await cur.execute(sql)
 
+        # 每次工具调用分配一个序号，同一次调用内 SQL_N 和 TABLE_N 共享 N
+        n = block_counter[0]
+        block_counter[0] = n + 1
+        sql_bid = f"SQL_{n}"
+        table_bid = f"TABLE_{n}"
+        render_blocks[sql_bid] = f"```sql\n{sql}\n```"
+
         is_write = bool(re.match(r"^\s*(INSERT|REPLACE|CREATE|ALTER)", sql, re.IGNORECASE))
 
         if is_write:
             await conn.commit()
             affected = cur.rowcount
-            n = block_counter[0]
-            block_counter[0] = n + 1
-            bid = f"SQL_{n}"
-            render_blocks[bid] = f"```sql\n{sql}\n```"
-            return f"执行成功，影响行数: {affected}。数据块: {bid}（执行的SQL）"
+            return (
+                f"执行成功，影响行数: {affected}。\n"
+                f"可用数据块：\n"
+                f"- {sql_bid}: 执行的SQL"
+            )
         else:
             rows = await cur.fetchall()
             row_count = len(rows) if rows else 0
 
-            n = block_counter[0]
-            # SQL 块
-            sql_bid = f"SQL_{n}"
-            render_blocks[sql_bid] = f"```sql\n{sql}\n```"
-            block_counter[0] = n + 1
-
             if row_count > 0:
-                # 数据块
-                tn = block_counter[0]
-                table_bid = f"TABLE_{tn}"
                 render_blocks[table_bid] = rows_to_markdown_table(rows[:100])
-                block_counter[0] = tn + 1
                 return (
-                    f"查询成功，返回 {row_count} 行。"
-                    f"数据块: {sql_bid}（SQL）, {table_bid}（结果表格，{row_count}行）"
+                    f"查询成功，返回 {row_count} 行。\n"
+                    f"可用数据块：\n"
+                    f"- {sql_bid}: 执行的SQL\n"
+                    f"- {table_bid}: 查询结果（{row_count}行）"
                 )
             else:
-                return f"查询成功，返回 0 行。数据块: {sql_bid}（SQL）"
+                return (
+                    f"查询成功，返回 0 行。\n"
+                    f"可用数据块：\n"
+                    f"- {sql_bid}: 执行的SQL"
+                )
 
     except Exception as e:
         logger.error("[Tool] execute_sql error: %s", e)
