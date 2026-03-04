@@ -231,7 +231,14 @@ export async function fetchMetricQuery(payload: MetricQueryRequest): Promise<Met
   return res.json();
 }
 
-// ────────── 血缘分析 API ──────────
+// ────────── 血缘分析 API（含前端缓存） ──────────
+
+// 前端内存缓存，避免重复请求血缘分析
+const _lineageCache = new Map<string, unknown>();
+
+function _cacheKey(data: Record<string, unknown>): string {
+  return JSON.stringify(data);
+}
 
 export interface MetricLineageTable {
   name: string;
@@ -262,6 +269,10 @@ export async function fetchMetricLineage(payload: {
   processedTables: { database: string; table: string; sourceTables: string[]; fieldMappings: { targetField: string; sourceTable: string; sourceExpr: string; transform: string }[]; insertSql: string }[];
   connectionString: string;
 }): Promise<MetricLineageResponse> {
+  const key = _cacheKey({ type: 'metric-lineage', metric: payload.metricDef.name, tables: payload.metricDef.tables });
+  const cached = _lineageCache.get(key);
+  if (cached) return cached as MetricLineageResponse;
+
   const res = await fetch('/api/metric-lineage', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -271,7 +282,9 @@ export async function fetchMetricLineage(payload: {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error((err as { error?: string }).error || `HTTP ${res.status}`);
   }
-  return res.json();
+  const data: MetricLineageResponse = await res.json();
+  _lineageCache.set(key, data);
+  return data;
 }
 
 export interface LineageSourceTable {
@@ -311,6 +324,10 @@ export async function fetchLineage(payload: {
   connectionString: string;
   targetTable: string;
 }): Promise<LineageResponse> {
+  const key = _cacheKey({ type: 'lineage', sql: payload.sql, target: payload.targetTable });
+  const cached = _lineageCache.get(key);
+  if (cached) return cached as LineageResponse;
+
   const res = await fetch('/api/lineage', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -320,5 +337,7 @@ export async function fetchLineage(payload: {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error((err as { error?: string }).error || `HTTP ${res.status}`);
   }
-  return res.json();
+  const data: LineageResponse = await res.json();
+  _lineageCache.set(key, data);
+  return data;
 }
